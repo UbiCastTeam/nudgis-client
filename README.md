@@ -5,6 +5,8 @@
 
 A python3 reference implementation of an UbiCast Nudgis API client.
 
+The API documentation is available on each Nudgis portal at [/static/mediaserver/docs/api/index.html](https://ubicast.tv/static/mediaserver/docs/api/index.html).
+
 ## Requirements
 
 * git
