@@ -1,0 +1,86 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=77.0"]
+
+[project]
+name = "nudgis-client"
+description = "A python3 reference implementation of an UbiCast Nudgis API client."
+version = "1.0"
+authors = [{name = "UbiCast"}]
+license = "LGPL-3.0-only"
+license-files = ["LICENSE"]
+readme = "README.md"
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Internet :: WWW/HTTP",
+]
+requires-python = ">=3.13"
+dependencies = [
+  "requests >= 2.32",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff",
+  "pytest",
+  "pytest-cov",
+  "types-requests",
+  "vulture",
+]
+
+[project.urls]
+Repository = "https://github.com/UbiCastTeam/nudgis-client"
+
+[tool.setuptools]
+packages = ["nudgisclient", "nudgisclient.lib"]
+include-package-data = false
+
+[tool.pytest.ini_options]
+addopts = "--verbose --tb=native --color=yes"
+log_date_format = "%H:%M:%S"
+log_format = "%(asctime)s.%(msecs)03d pid:%(process)d %(name)s %(levelname)s %(message)s"
+log_level = "DEBUG"
+testpaths = "tests/"
+
+[tool.coverage.run]
+source_dirs = ["nudgisclient", "examples"]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+respect-gitignore = true
+exclude = [".git", "submodules"]
+
+[tool.ruff.format]
+indent-style = "space"
+quote-style = "single"
+
+[tool.ruff.lint]
+# https://docs.astral.sh/ruff/rules/
+select = ["A", "B", "E", "F", "G", "I", "N", "Q"]
+
+[tool.ruff.lint.flake8-quotes]
+docstring-quotes = "double"
+inline-quotes = "single"
+multiline-quotes = "single"
+
+[tool.ruff.lint.isort]
+case-sensitive = false
+force-sort-within-sections = true
+force-wrap-aliases = true
+combine-as-imports = true
+forced-separate = ["tests"]
+order-by-type = false
+section-order = [
+  "future",
+  "standard-library",
+  "third-party",
+  "first-party",
+  "local-folder",
+]
+split-on-trailing-comma = true

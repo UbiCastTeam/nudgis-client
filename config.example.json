@@ -1,0 +1,10 @@
+{
+    "API_KEY": "MYAPIKEY",
+    "CLIENT_ID": "python-api-client",
+    "PROXIES": {
+        "http": "",
+        "https": ""
+    },
+    "SERVER_URL": "https://mynudgis.ubicast.tv",
+    "VERIFY_SSL": true
+}

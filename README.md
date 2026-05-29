@@ -1,3 +1,234 @@
+![PyPI - Python Version](https://img.shields.io/pypi/pyversions/nudgis-client.svg)
+![PyPI](https://img.shields.io/pypi/v/nudgis-client.svg)
+
 # UbiCast Nudgis API client
 
 A python3 reference implementation of an UbiCast Nudgis API client.
+
+## Requirements
+
+* git
+* python >= 3.13 (download the latest stable release from https://www.python.org/downloads/)
+
+Optional:
+* python3-venv
+
+## Installation
+
+### Linux & OSX
+
+For development, the package can be installed in editable mode to allow changes on it :
+
+```sh
+git clone https://github.com/UbiCastTeam/nudgis-client.git
+cd nudgis-client/
+python3 -m venv .venv
+source .venv/bin/activate  # remember to run this every time you enter the folder and need to restore the environment
+python3 -m pip install --editable .
+```
+
+If you want to install it system-wide as dependency, the releases are available on pypi:
+```sh
+pip install nudgis-client
+```
+
+### Windows
+
+* Open cmd.exe and check python is available with `py --version` which should display the Python version
+
+```
+>py --version
+Python 3.13.13
+```
+
+* From this project root path, run:
+
+```
+> py -m venv .venv
+> ".venv/Scripts/activate.bat"
+> pip install .
+```
+
+* Check it works with:
+
+```
+>py -m examples.ping_server
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\User\src\nudgis-client\examples\ping_server.py", line 17, in <module>
+    print(ngc.api('/'))
+          ^^^^^^^^^^^^
+  File "C:\Users\User\src\nudgis-client\nudgisclient\client.py", line 221, in api
+    result = self.request(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\User\src\nudgis-client\nudgisclient\client.py", line 98, in request
+    self.check_conf()
+  File "C:\Users\User\src\nudgis-client\nudgisclient\client.py", line 71, in check_conf
+    configuration_lib.check_conf(self.conf)
+  File "C:\Users\User\src\nudgis-client\nudgisclient\lib\configuration.py", line 87, in check_conf
+    raise ConfigurationError('The value of "SERVER_URL" is not set. Please configure it.')
+nudgisclient.lib.configuration.ConfigurationError: The value of "SERVER_URL" is not set. Please configure it.
+```
+
+Despite the error above, it shows that the installation is complete.
+
+## Configuration
+
+Copy the provided `config.json.example` file into e.g. `myconfig.json`, edit it with a text editor and fill the URL and API KEY.
+
+* Check it works with:
+
+Linux:
+```
+$ python3 ./examples/ping.py myconfig.json
+{'success': True, 'nudgis': '13.1.1'}
+```
+Windows:
+```
+$ py ./examples/ping.py myconfig.json
+{'success': True, 'nudgis': '13.1.1'}
+```
+
+## Client class instantiation
+
+The client class (`nudgisclient`.`client`.`NudgisClient`) takes two arguments:
+* `local_conf`: This argument can be either a dict, a path (`str` object) or a unix user (`unix:msuser` for example) -- only aplicable from running scripts from within the server running nudgis (Nudgis). The default value is `None`, which means no configuration.
+* `setup_logging`: This argument must be a boolean. If set to `True`, the logging to console will be configured. The default value is `True`.
+
+## Configuration
+
+You can see available parameters in the default configuration file :
+[Default configuration](/nudgisclient/conf.py)
+
+The local configuration must be a json file.
+
+## Examples
+
+### Start/Stop a live
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+response = ngc.api('/lives/prepare', method='post')
+if response['success']:
+    oid = response['oid']
+    rtmp_uri = response['publish_uri']
+
+    print(oid, rtmp_uri)
+
+    print(ngc.api('/lives/start', method='post', data={'oid': oid}))
+
+    print(ngc.api('/lives/stop', method='post', data={'oid': oid}))
+```
+
+### Remove all users function
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+
+def remove_all_users():
+    print('Remove all users')
+    users = ngc.api('/users')['users']
+
+    for user in users:
+        ngc.api('/users/delete', method='get', params={'id': user['id']})
+```
+
+### Add media with a video, make it published at once
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+print(ngc.add_media('Test multichunk upload mp4', file_path='test.mp4', validated='yes', speaker_email='user@domain.com'))
+```
+
+### Create user personal channel and upload into it
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+personal_channel_oid = ngc.api('/channels/personal/', method='get', params={'email': 'test@test.com'}).get('oid')
+
+respone_like = {
+    'slug': 'testtestcom_05881',
+    'oid': 'c125855df7d36iudslp3',
+    'dbid': 113,
+    'title': 'test@test.com',
+    'success': True
+}
+if personal_channel_oid:
+    print('Uploading to personal channel %s' % personal_channel_oid)
+
+    print(ngc.add_media('Test multichunk upload mp4', file_path='test.mp4', validated='yes', speaker_email='user@domain.com', channel=personal_channel_oid))
+```
+
+### Add media with a zip
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+print(ngc.add_media('Test multichunk upload zip', file_path='/tmp/test.zip'))
+print(ngc.add_media(file_path='test.mp4'))
+```
+
+### Add a user
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+print(ngc.api('users/add/', method='post', data={'email': 'test@test.com'}))
+```
+
+### Add users with csv file; example file (header should be included):
+
+users.csv :
+
+``` csv
+Firstname;Lastname;Email;Company
+Albert;Einstein;albert.einstein@test.com;Humanity
+```
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+ngc.import_users_csv('users.csv')
+```
+
+### Add an annotation
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+print(ngc.api('annotations/post', params={'oid': 'v125849d470d7v92kvtc', 'time': 1000}))
+```
+
+### Get Chapters
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+print(ngc.api('annotations/chapters/list', params={'oid': 'v125849d470d7v92kvtc'}))
+```
+
+### Get annotations types list and print chapters id
+
+``` python
+from nudgisclient import NudgisClient
+ngc = NudgisClient(local_conf='your-conf.json')
+
+response = ngc.api('annotations/types/list', params={'oid': 'v125849d470d7v92kvtc'})
+for a in response['types']:
+    if a['slug'] == 'chapter':
+        print(a['id'])
+```

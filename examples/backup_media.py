@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+'''
+Script to backup media (metadata and best resource) from a Nudgis portal.
+
+By default, files are placed in a directory named "backups" in the current directory.
+
+Usage example:
+python3 examples/backup_media.py --conf conf.json --date 2020-01-01
+'''
+
+import argparse
+import datetime
+import os
+import sys
+
+
+def make_backup(ngc, dir_path, limit_date, as_tree=False, use_add_date=False, enable_delete=False):
+    print('Starting backups...')
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+    date_field = 'add_date' if use_add_date else 'creation'
+
+    more = True
+    start = datetime.datetime.strftime(limit_date, '%Y-%m-%d 00:00:00')
+    index = 0
+    backuped = list()
+    failed = list()
+    while more:
+        print('//// Making request on latest (start=%s)' % start)
+        response = ngc.api('latest/', params=dict(start=start, order_by=date_field, content='vlp', count=20))
+        for item in response['items']:
+            index += 1
+            media_link = ngc.conf['SERVER_URL'] + '/permalink/' + item['oid'] + '/'
+            print(f'// {C.PURPLE}Media {index}:{C.RESET} "{media_link}" {format_item(item)}')
+            media_date = datetime.datetime.strptime(item[date_field][0:10], '%Y-%m-%d').date()
+            if media_date > limit_date:
+                print('No backup for media %s because creation date %s is newer than backup date %s' % (
+                    format_item(item), item['creation'], limit_date))
+            else:
+                try:
+                    ngc.backup_media(item, dir_path, replicate_tree=as_tree)
+                except Exception as err:
+                    print(f'{C.RED}{err}{C.RESET}')
+                    failed.append((item, str(err)))
+                    if enable_delete:
+                        print('Media %s will not be deleted because it has not been successfully downloaded.' % (
+                            format_item(item)))
+                else:
+                    print(f'{C.GREEN}Backuped{C.RESET}')
+                    backuped.append(item)
+                    if enable_delete:
+                        try:
+                            ngc.api(
+                                'medias/delete/',
+                                method='post',
+                                data=dict(oid=item['oid'], delete_metadata='yes', delete_resources='yes', force='yes')
+                            )
+                        except Exception as e:
+                            print('Failed to delete media %s: %s' % (format_item(item), e))
+                        else:
+                            print('Media %s have been deleted successfully.' % format_item(item))
+        start = response['max_date']
+        more = response['more']
+    print('Done.\n')
+
+    if backuped:
+        print('%sMedia backuped successfully (%s):%s' % (C.GREEN, len(backuped), C.RESET))
+        for item in backuped:
+            print('  [%sOK%s] %s' % (C.GREEN, C.RESET, format_item(item)))
+    if failed:
+        print('%sMedia backups failed (%s):%s' % (C.RED, len(failed), C.RESET))
+        for item, error in failed:
+            print('  [%sKO%s] %s: %s' % (C.RED, C.RESET, format_item(item), error))
+        print('%sSome media were not backuped.%s' % (C.YELLOW, C.RESET))
+        return 1
+    if backuped:
+        print('%sAll media have been backuped successfully.%s' % (C.GREEN, C.RESET))
+    else:
+        print('No media to backup.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from nudgisclient import NudgisClient
+    from nudgisclient.lib.utils import (
+        format_item,
+        TTYColors as C,
+    )
+
+    parser = argparse.ArgumentParser(description=__doc__.strip())
+
+    parser.add_argument(
+        '--conf',
+        dest='configuration_path',
+        help='Path to the configuration file.',
+        required=True,
+        type=str)
+    parser.add_argument(
+        '--date',
+        dest='limit_date',
+        help=('All media created/added (depending on "--use-add-date") prior to the given date will be backuped. '
+              'Date format: "YYYY-MM-DD".'),
+        required=True,
+        type=str)
+    parser.add_argument(
+        '--directory',
+        default='backups',
+        dest='dir_path',
+        help='Directory in which backuped media should be added.',
+        type=str)
+    parser.add_argument(
+        '--tree',
+        action='store_true',
+        default=False,
+        dest='as_tree',
+        help='Place backuped media in sub directories depending on the channels path of the media.')
+    parser.add_argument(
+        '--use-add-date',
+        action='store_true',
+        default=False,
+        dest='use_add_date',
+        help='Use add date of media instead of creation date.')
+    parser.add_argument(
+        '--delete',
+        action='store_true',
+        default=False,
+        dest='enable_delete',
+        help='Delete media from server once successfully backuped.')
+
+    args = parser.parse_args()
+
+    print('Configuration path: %s' % args.configuration_path)
+    print('Date limit: %s' % args.limit_date)
+    print('Backups directory: %s' % args.dir_path)
+    print('Enable delete: %s' % args.enable_delete)
+
+    # Check if file exists
+    if not os.path.exists(args.configuration_path):
+        print('Invalid path for configuration file.')
+        sys.exit(1)
+
+    # Check date format
+    try:
+        limit_date = datetime.datetime.strptime(str(args.limit_date), '%Y-%m-%d').date()
+    except ValueError:
+        print('Incorrect data format, should be "YYYY-MM-DD".')
+        sys.exit(1)
+
+    ngc = NudgisClient(args.configuration_path)
+    ngc.check_server()
+    # Increase default timeout because backups can be very disk intensive and slow the server
+    ngc.conf['TIMEOUT'] = max(60, ngc.conf['TIMEOUT'])
+
+    rc = make_backup(ngc, args.dir_path, limit_date, args.as_tree, args.use_add_date, args.enable_delete)
+    sys.exit(rc)

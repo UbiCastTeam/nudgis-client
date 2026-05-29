@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+Script to restore media from a directory to a Nudgis portal.
+Media to restore should be zip files with their resource inside (as produced by the backup_media script).
+
+Usage example:
+python3 examples/restore_media.py --conf conf.json --path backups --channel 'import test'
+"""
+
+import argparse
+import json
+import os
+import sys
+import traceback
+import zipfile
+
+
+def restore_path(ngc, path, top_channel_path):
+    if not os.path.exists(path):
+        print('%sERROR:%s Requested directory does not exist.' % (C.RED, C.RESET))
+        return 1
+
+    print('\nGetting list of media to restore...')
+    to_restore = list()
+    if os.path.isdir(path):
+        for dir_path, _dir_names, file_names in os.walk(path, followlinks=True):
+            for file_name in file_names:
+                file_path = os.path.join(dir_path, file_name)
+                if not file_path.endswith('.zip'):
+                    print('Path %s ignored (not a zip file).' % file_path)
+                else:
+                    to_restore.append(file_path)
+    elif os.path.isfile(path):
+        if not path.endswith('.zip'):
+            print('Path %s ignored (not a zip file).' % path)
+        else:
+            to_restore.append(path)
+    else:
+        print('%sERROR:%s Requested path is neither a directory neither a file.' % (C.RED, C.RESET))
+        return 1
+    if not to_restore:
+        print('No valid file to restore.')
+        return 1
+    print('Number of media to restore: %s.' % len(to_restore))
+
+    print('\nStarting restoration...')
+    restored = list()
+    existing = list()
+    failed = list()
+    for index, file_path in enumerate(to_restore):
+        print('Media %s / %s (%s %%):' % (index + 1, len(to_restore), round(100 * (index + 1) / len(to_restore))))
+        try:
+            is_new, url = _restore_file(ngc, file_path, top_channel_path)
+        except Exception as e:
+            print('%s%s: %s%s' % (C.RED, e.__class__.__name__, e, C.RESET))
+            traceback.print_exc()
+            failed.append((file_path, str(e)))
+        else:
+            if is_new:
+                restored.append((file_path, url))
+            else:
+                existing.append((file_path, url))
+    print('Done.\n')
+
+    print('Report:')
+    if restored:
+        print('%sMedia restored successfully (%s):%s' % (C.GREEN, len(restored), C.RESET))
+        for path, url in restored:
+            print('  [%sOK%s] %s: %s' % (C.GREEN, C.RESET, path, url))
+    if existing:
+        print('%sMedia already existing (%s):%s' % (C.GREEN, len(existing), C.RESET))
+        for path, url in existing:
+            print('  [%sOK%s] %s: %s' % (C.GREEN, C.RESET, path, url))
+    if failed:
+        print('%sMedia restoration failed (%s):%s' % (C.RED, len(failed), C.RESET))
+        for path, error in failed:
+            print('  [%sKO%s] %s: %s' % (C.RED, C.RESET, path, error))
+        print('%sSome media were not restored.%s' % (C.RED, C.RESET))
+        return 1
+    print('%sAll media were restored.%s' % (C.GREEN, C.RESET))
+    return 0
+
+
+def _restore_file(ngc, path, top_channel_path):
+    print('Restoring media from file "%s"...' % path)
+    old_version = ngc.get_server_version() < (9, 0, 0)
+    special_res = None
+    with zipfile.ZipFile(path, 'r') as zip_file:
+        # CRC check of zip file
+        files_with_error = zip_file.testzip()
+        if files_with_error:
+            raise RuntimeError('Some files have errors in the zip file: %s' % files_with_error)
+        # Get media metadata
+        metadata_json = zip_file.open('metadata.json').read()
+        # Check if media is using special resource
+        if old_version:
+            for name in zip_file.namelist():
+                if name.endswith('.youtube'):
+                    special_res = 'YouTube: ' + zip_file.open(name).read()
+                    break
+                elif name.endswith('.embed'):
+                    special_res = 'Embed: ' + zip_file.open(name).read()
+                    break
+    metadata = json.loads(metadata_json)
+    if not metadata.get('path') and not metadata.get('category'):
+        raise RuntimeError('Media has no channel defined in metadata.json file.')
+    is_new = False
+    url = None
+    if metadata.get('path') or top_channel_path:
+        channel_path = metadata['path'] if metadata.get('path') else metadata['category']
+        if top_channel_path:
+            channel_path = top_channel_path + '/' + channel_path
+        # check if media already exists
+        if old_version:
+            print('The server version is too old, unable to check media existence.')
+        else:
+            try:
+                response = ngc.api(
+                    'medias/get/',
+                    params=dict(parents=channel_path, title=metadata['title'])
+                )
+            except ngc.RequestError as err:
+                if err.status_code != 404:
+                    raise
+            else:
+                oid = response['info']['oid']
+                url = ngc.conf['SERVER_URL'] + '/permalink/' + oid + '/'
+                print('Media already exists, it will not be added twice.')
+                if oid.startswith('v'):
+                    # check resource if media is a video
+                    resources = ngc.api('medias/resources-list/', params=dict(oid=oid))['resources']
+                    if not resources:
+                        raise RuntimeError(
+                            'The media already exist but has no resources. '
+                            f'Please restore the resource manually in media "{url}".'
+                        )
+        channel_target = 'mscpath-' + channel_path
+    else:
+        channel_target = metadata['category']
+    # add media if needed
+    if not url:
+        item = ngc.add_media(
+            file_path=path,
+            channel=channel_target,
+            transcode='yes',
+            detect_slides='no',
+            autocam='no',
+            own_media='no'
+        )
+        oid = item['oid']
+        url = ngc.conf['SERVER_URL'] + '/permalink/' + oid + '/'
+        is_new = True
+    if old_version and special_res:
+        raise RuntimeError(
+            'The media metadata have been restored but the media uses a resource that should be restored manually:'
+            f'\n{special_res}\nMedia url: {url}'
+        )
+    print('Media restored: "%s".' % url)
+    return is_new, url
+
+
+if __name__ == '__main__':
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from nudgisclient import NudgisClient
+    from nudgisclient.lib.utils import TTYColors as C
+
+    parser = argparse.ArgumentParser(description=__doc__.strip())
+
+    parser.add_argument(
+        '--conf',
+        dest='configuration_path',
+        help='Path to the configuration file.',
+        required=True,
+        type=str)
+    parser.add_argument(
+        '--path',
+        default='path',
+        dest='path',
+        help='Directory in which media should be restored.',
+        type=str)
+    parser.add_argument(
+        '--channel',
+        dest='channel',
+        help='Path to an existing channel in which all restored media should be added. '
+             'The path should be splitted by slashes and can contain slug or title. '
+             'Example: "Channel A/Channel B". If no value is given, media will be restored in their original channel.',
+        required=False,
+        type=str)
+
+    args = parser.parse_args()
+
+    print('Configuration path: %s' % args.configuration_path)
+    print('Path: %s' % args.path)
+    print('Channel: %s' % args.channel)
+
+    # Check if file exists
+    if not os.path.exists(args.configuration_path):
+        print('Invalid path for configuration file.')
+        sys.exit(1)
+
+    ngc = NudgisClient(args.configuration_path)
+    ngc.get_server_version()
+
+    rc = restore_path(ngc, args.path, args.channel)
+    sys.exit(rc)
