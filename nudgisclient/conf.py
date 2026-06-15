@@ -30,9 +30,12 @@ BASE_CONF = {
     # Disabled by default
     'MAX_RETRY': 0,
 
+    # Set of uppercased HTTP method verbs that we should retry on
+    'RETRY_ALLOWED_METHODS': {'DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT', 'TRACE'},
+
     # List of response status codes for requests allowed to be retried
     # To get details on status codes:
-    # https://fr.wikipedia.org/wiki/Liste_des_codes_HTTP
+    # https://en.wikipedia.org/wiki/List_of_HTTP_status_codes
     # Connection errors are always included in requests to retry
     'RETRY_STATUS_CODES': {429, 500, 502, 503, 504, 507, 509},
 

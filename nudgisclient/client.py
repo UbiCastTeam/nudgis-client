@@ -130,6 +130,7 @@ class NudgisClient():
                     # https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html#urllib3.util.Retry
                     retries = Retry(
                         total=self.conf['MAX_RETRY'],
+                        allowed_methods=self.conf['RETRY_ALLOWED_METHODS'],
                         status_forcelist=self.conf['RETRY_STATUS_CODES'],
                         backoff_factor=self.conf['RETRY_DELAY_FACTOR'],
                     )
