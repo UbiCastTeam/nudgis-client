@@ -1,6 +1,10 @@
 DOCKER_IMAGE ?= nudgis-client:latest
 DOCKER_RUN ?= docker run --rm --user "$(shell id -u):$(shell id -g)" -v ${CURDIR}:/opt/src
 
+git_reset:
+	git fetch --all
+	git reset --hard origin/$(shell git branch --show-current)
+
 build:
 	docker build -t ${DOCKER_IMAGE} ${BUILD_ARGS} .
 
