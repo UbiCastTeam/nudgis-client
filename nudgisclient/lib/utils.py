@@ -1,4 +1,5 @@
 from datetime import timedelta
+import logging
 import re
 import sys
 
@@ -19,6 +20,14 @@ if sys.stdout.isatty():
 else:
     class TTYColors:
         GRAY = RED = GREEN = YELLOW = BLUE = PURPLE = TEAL = RESET = ''
+
+
+def configure_logging(level: str = 'INFO') -> None:
+    logging.basicConfig(
+        format='%(asctime)s.%(msecs)03d pid:%(process)d %(name)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        level=getattr(logging, level),
+    )
 
 
 def _size_repr(value: int, unit: str, short: bool = True) -> str:

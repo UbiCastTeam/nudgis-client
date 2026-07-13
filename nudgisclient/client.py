@@ -14,6 +14,7 @@ from .lib import (
     download as download_lib,
     upload as upload_lib,
     users_csv as users_csv_lib,
+    utils as utils_lib,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,11 +42,7 @@ class NudgisClient():
         # `local_conf` can be either a dict, a path (`str` object) or a unix user (`unix:msuser` for example)
         # Setup logging
         if setup_logging:
-            logging.basicConfig(
-                format='%(asctime)s.%(msecs)03d pid:%(process)d %(name)s %(levelname)s %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S',
-                level=logging.INFO,
-            )
+            utils_lib.configure_logging()
         # Read conf file
         self.load_conf(local_conf)
         # Configure logging
