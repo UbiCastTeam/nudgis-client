@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -47,13 +48,21 @@ def make_client(
         side_effect=catalog_exc, return_value=catalog if catalog is not None else {}
     )
     client.add_media = mock.MagicMock(
-        side_effect=lambda **kwargs: {'oid': 'v_' + kwargs.get('external_ref', 'x')}
+        side_effect=lambda **kwargs: {
+            'oid': 'v_' + kwargs.get('external_ref', 'x'),
+            'slug': kwargs.get('slug', ''),
+        }
     )
 
     def api(url, **kwargs):
         if api_exc and url in api_exc:
             raise api_exc[url]
-        return (api_map or {}).get(url, {})
+        if api_map and url in api_map:
+            return api_map[url]
+        # By default the API key has the permissions required by server_checks.
+        if url == 'users/me/':
+            return {'user': {'permissions': {'can_change_users': True}}}
+        return {}
 
     client.api = mock.MagicMock(side_effect=api)
     return client
@@ -79,7 +88,8 @@ def test_scan_basic(tmp_path):
     write(tmp_path / 'readme.txt')  # unexpected file -> warning
 
     report = mi.Report()
-    groups = mi.scan_source_tree(tmp_path, None, report)
+    summary = mi.Summary()
+    groups = mi.scan_source_tree(tmp_path, None, report, summary)
 
     assert set(groups) == {'m1', 'm2'}
     assert set(groups['m1'].subtitles) == {'fre'}
@@ -90,11 +100,30 @@ def test_scan_basic(tmp_path):
 
 
 def test_scan_filename_too_long(tmp_path):
-    # 251 chars: allowed by the filesystem but above MAX_FIELD_LENGTH (250).
-    write(tmp_path / ('x' * 247 + '.mp4'))
+    write(tmp_path / 'ok.mp4')
+    # 201 chars: allowed by the filesystem but above MAX_FIELD_LENGTH (200).
+    write(tmp_path / ('x' * 197 + '.mp4'))
     report = mi.Report()
-    mi.scan_source_tree(tmp_path, None, report)
-    assert any('File name too long' in err for err in report.errors)
+    summary = mi.Summary()
+    groups = mi.scan_source_tree(tmp_path, None, report, summary)
+    # The too-long video is skipped as unimportable, the valid one is kept.
+    assert set(groups) == {'ok'}
+    assert len(summary.unimportable_media[mi.UNIMPORTABLE_FILENAME]) == 1
+    assert any('name too long' in w for w in report.warnings)
+    assert not report.errors
+
+
+def test_scan_filename_too_long_non_video(tmp_path):
+    write(tmp_path / 'ok.mp4')
+    # A non-video file with a too-long name is simply ignored, not counted as a media.
+    write(tmp_path / ('x' * 247 + '.srt'))
+    report = mi.Report()
+    summary = mi.Summary()
+    groups = mi.scan_source_tree(tmp_path, None, report, summary)
+    assert set(groups) == {'ok'}
+    assert not summary.unimportable_media
+    assert any('too-long name' in w for w in report.warnings)
+    assert not report.errors
 
 
 def test_scan_multistream_warnings(tmp_path):
@@ -104,29 +133,38 @@ def test_scan_multistream_warnings(tmp_path):
     write(tmp_path / 'noLang.srt')  # no "_lang" suffix
 
     report = mi.Report()
-    groups = mi.scan_source_tree(tmp_path, None, report)
+    summary = mi.Summary()
+    groups = mi.scan_source_tree(tmp_path, None, report, summary)
 
     assert set(groups['multi'].extra_streams) == {2, 4}
     assert any('non-contiguous' in w for w in report.warnings)
     assert any('will be combined with ffmpeg' in w for w in report.warnings)
-    assert any('naming rule' in err for err in report.warnings)
+    assert any('naming rule' in w for w in report.warnings)
+    assert not report.errors
 
 
 def test_scan_duplicate_source_id(tmp_path):
     write(tmp_path / 'a' / 'dup.mp4')
     write(tmp_path / 'b' / 'dup.mp4')
     report = mi.Report()
-    mi.scan_source_tree(tmp_path, None, report)
-    assert any('Duplicate source id' in err for err in report.errors)
+    summary = mi.Summary()
+    groups = mi.scan_source_tree(tmp_path, None, report, summary)
+    # The first file is kept, the duplicate is skipped as unimportable.
+    assert set(groups) == {'dup'}
+    assert summary.unimportable_media[mi.UNIMPORTABLE_DUPLICATE] == ['dup']
+    assert any('Duplicate source id' in w for w in report.warnings)
+    assert not report.errors
 
 
 def test_scan_multistream_without_main(tmp_path):
     write(tmp_path / 'clip.mp4')
     write(tmp_path / 'clip_stream2.mp4')
-    write(tmp_path / 'clip_stream2_stream2.mp4')  # secondary of "clip_2", which is not a main media
+    write(tmp_path / 'clip_stream2_stream2.mp4')  # secondary of "clip_stream2", not a main media
     report = mi.Report()
-    mi.scan_source_tree(tmp_path, None, report)
-    assert any('has no main media' in err for err in report.errors)
+    summary = mi.Summary()
+    mi.scan_source_tree(tmp_path, None, report, summary)
+    assert any('no main media' in w for w in report.warnings)
+    assert not report.errors
 
 
 def test_scan_multistream_out_of_range(tmp_path):
@@ -134,16 +172,20 @@ def test_scan_multistream_out_of_range(tmp_path):
     write(tmp_path / 'range_stream1.mp4')  # index < 2
     write(tmp_path / 'range_stream7.mp4')  # index > 6
     report = mi.Report()
-    mi.scan_source_tree(tmp_path, None, report)
-    assert sum('out-of-range' in err for err in report.errors) == 2
+    summary = mi.Summary()
+    mi.scan_source_tree(tmp_path, None, report, summary)
+    assert sum('out-of-range' in w for w in report.warnings) == 2
+    assert not report.errors
 
 
 def test_scan_linked_orphan(tmp_path):
     write(tmp_path / 'vid.mp4')
     write(tmp_path / 'orphan_fre.srt')  # base "orphan" has no media
     report = mi.Report()
-    mi.scan_source_tree(tmp_path, None, report)
-    assert any('has no main media' in err for err in report.errors)
+    summary = mi.Summary()
+    mi.scan_source_tree(tmp_path, None, report, summary)
+    assert any('no main media' in w for w in report.warnings)
+    assert not report.errors
 
 
 def test_scan_linked_duplicate(tmp_path):
@@ -151,13 +193,16 @@ def test_scan_linked_duplicate(tmp_path):
     write(tmp_path / 'vid_fre.srt')
     write(tmp_path / 'vid_fre.vtt')  # same base + language
     report = mi.Report()
-    mi.scan_source_tree(tmp_path, None, report)
-    assert any('Duplicate subtitle file' in err for err in report.errors)
+    summary = mi.Summary()
+    mi.scan_source_tree(tmp_path, None, report, summary)
+    assert any('duplicate subtitle' in w.lower() for w in report.warnings)
+    assert not report.errors
 
 
 def test_scan_empty(tmp_path):
     report = mi.Report()
-    groups = mi.scan_source_tree(tmp_path, None, report)
+    summary = mi.Summary()
+    groups = mi.scan_source_tree(tmp_path, None, report, summary)
     assert groups == {}
     assert any('No media file to import found' in err for err in report.errors)
 
@@ -169,7 +214,8 @@ def test_scan_ids_to_process(tmp_path):
     write(tmp_path / 'm2_fre.srt')
     write(tmp_path / 'm2_stream2.mp4')
     report = mi.Report()
-    groups = mi.scan_source_tree(tmp_path, ['m1'], report)
+    summary = mi.Summary()
+    groups = mi.scan_source_tree(tmp_path, ['m1'], report, summary)
     assert set(groups) == {'m1'}
     assert set(groups['m1'].subtitles) == {'fre'}
     assert not report.errors
@@ -183,7 +229,8 @@ def test_scan_ids_to_process_prefix_collisions(tmp_path):
     write(tmp_path / 'm1extra_stream2.mp4')
     write(tmp_path / 'm1extra_fre.srt')
     report = mi.Report()
-    groups = mi.scan_source_tree(tmp_path, ['m1'], report)
+    summary = mi.Summary()
+    groups = mi.scan_source_tree(tmp_path, ['m1'], report, summary)
     assert set(groups) == {'m1'}
     assert not groups['m1'].extra_streams
     assert not report.errors
@@ -194,8 +241,9 @@ def test_scan_ids_to_process_prefix_collisions(tmp_path):
 
 def test_metadata_missing_file(tmp_path):
     report = mi.Report()
+    summary = mi.Summary()
     groups = {'m1': group('m1')}
-    mi.validate_metadata_csv(tmp_path / 'metadata.csv', groups, None, report)
+    mi.validate_metadata_csv(tmp_path / 'metadata.csv', groups, None, report, summary)
     assert groups['m1'].metadata is None
     assert any('No "metadata.csv"' in w for w in report.warnings)
 
@@ -203,16 +251,19 @@ def test_metadata_missing_file(tmp_path):
 def test_metadata_missing_columns(tmp_path):
     path = write(tmp_path / 'metadata.csv', b'foo,bar\n1,2\n')
     report = mi.Report()
+    summary = mi.Summary()
     groups = {'m1': group('m1')}
-    mi.validate_metadata_csv(path, groups, None, report)
+    mi.validate_metadata_csv(path, groups, None, report, summary)
     assert groups['m1'].metadata is None
+    # A structurally broken CSV is a fatal error.
     assert any('missing mandatory columns' in err for err in report.errors)
 
 
 def test_metadata_unknown_column(tmp_path):
     path = write(tmp_path / 'metadata.csv', b'source_id,title,weird\nm1,Title,x\n')
     report = mi.Report()
-    mi.validate_metadata_csv(path, {'m1': group('m1')}, None, report)
+    summary = mi.Summary()
+    mi.validate_metadata_csv(path, {'m1': group('m1')}, None, report, summary)
     assert any('unknown column "weird"' in w for w in report.warnings)
 
 
@@ -224,37 +275,64 @@ def test_metadata_valid(tmp_path):
     )
     path = write(tmp_path / 'metadata.csv', content.encode('utf-8'))
     report = mi.Report()
+    summary = mi.Summary()
     groups = {'m1': group('m1')}
-    mi.validate_metadata_csv(path, groups, None, report)
+    mi.validate_metadata_csv(path, groups, None, report, summary)
     assert groups['m1'].metadata is not None
     assert not report.errors
+    assert summary.invalid_metadata == 0
 
 
-def test_metadata_all_errors(tmp_path):
+def test_metadata_invalid_rows_dropped(tmp_path):
+    # Rows that cannot be tied to a media are dropped and counted as invalid entries.
     content = (
         'source_id,title,slug,language,creation,speaker_name,speaker_email,validated\n'
         ',Title,,,,,,\n'  # empty source_id
         'good,Title,goodslug,fre,2026-01-01T00:00:00,,,yes\n'  # valid row (slug recorded)
         'good,Title,other,fre,,,,\n'  # duplicate source_id
         'ghost,Title,,,,,,\n'  # source_id not in groups
-        'm2,,Bad Slug,xx,not-a-date,A|B,a@x,maybe\n'  # title/slug/lang/date/speaker/validated
-        'm3,Title,goodslug,,,,,\n'  # duplicate slug
     )
     path = write(tmp_path / 'metadata.csv', content.encode('utf-8'))
-    groups = {'good': group('good'), 'm2': group('m2'), 'm3': group('m3')}
+    groups = {'good': group('good')}
     report = mi.Report()
-    mi.validate_metadata_csv(path, groups, None, report)
-    joined = '\n'.join(report.errors)
-    assert 'empty "source_id"' in joined
-    assert 'duplicate "source_id"' in joined
-    assert '"source_id" "ghost"' in joined
-    assert 'empty "title"' in joined
-    assert 'invalid "slug" "bad slug"' in joined
-    assert 'is already used' in joined
-    assert 'invalid "language" "xx"' in joined
-    assert 'invalid "creation"' in joined
-    assert 'different number of values' in joined
-    assert 'invalid "validated" "maybe"' in joined
+    summary = mi.Summary()
+    mi.validate_metadata_csv(path, groups, None, report, summary)
+    assert not report.errors
+    assert summary.invalid_metadata == 3
+    assert groups['good'].metadata['slug'] == 'goodslug'
+
+
+def test_metadata_invalid_fields_cleaned(tmp_path):
+    # Invalid optional fields are cleaned in place so the media is still importable.
+    content = (
+        'source_id,title,slug,language,creation,speaker_name,speaker_email,validated\n'
+        'm2,,Bad Slug,xx,not-a-date,A|B,a@x,maybe\n'  # title/slug/lang/date/speaker/validated
+        'm3,Title,goodslug,,,,,\n'  # slug recorded on m3
+        'm4,Title,goodslug,,,,,\n'  # duplicate slug -> cleaned
+    )
+    path = write(tmp_path / 'metadata.csv', content.encode('utf-8'))
+    groups = {'m2': group('m2'), 'm3': group('m3'), 'm4': group('m4')}
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.validate_metadata_csv(path, groups, None, report, summary)
+    assert not report.errors
+    assert summary.invalid_metadata == 0
+    m2 = groups['m2'].metadata
+    assert m2['title'] == ''
+    assert m2['slug'] == ''
+    assert m2['language'] == ''
+    assert m2['creation'] == ''
+    assert m2['speaker_name'] == '' and m2['speaker_email'] == ''
+    assert m2['validated'] == ''
+    assert groups['m3'].metadata['slug'] == 'goodslug'
+    assert groups['m4'].metadata['slug'] == ''  # duplicate slug dropped
+    warnings = '\n'.join(report.warnings)
+    assert 'invalid "slug"' in warnings
+    assert 'invalid "language"' in warnings
+    assert 'invalid "creation"' in warnings
+    assert 'different number of values' in warnings
+    assert 'invalid "validated"' in warnings
+    assert 'already used' in warnings
 
 
 def test_metadata_too_long_field(tmp_path):
@@ -264,8 +342,12 @@ def test_metadata_too_long_field(tmp_path):
         (METADATA_HEADER + f'\nm1,{long_title},,,,,,,,,,,,,,,,\n').encode('utf-8'),
     )
     report = mi.Report()
-    mi.validate_metadata_csv(path, {'m1': group('m1')}, None, report)
-    assert any('value too long' in err for err in report.errors)
+    summary = mi.Summary()
+    groups = {'m1': group('m1')}
+    mi.validate_metadata_csv(path, groups, None, report, summary)
+    assert any('value too long' in w for w in report.warnings)
+    assert len(groups['m1'].metadata['title']) == mi.MAX_FIELD_LENGTH
+    assert not report.errors
 
 
 def test_metadata_media_without_row(tmp_path):
@@ -273,7 +355,8 @@ def test_metadata_media_without_row(tmp_path):
         tmp_path / 'metadata.csv', (METADATA_HEADER + '\nm1,Title,,,,,,,,,,,,,,,,\n').encode()
     )
     report = mi.Report()
-    mi.validate_metadata_csv(path, {'m1': group('m1'), 'm2': group('m2')}, None, report)
+    summary = mi.Summary()
+    mi.validate_metadata_csv(path, {'m1': group('m1'), 'm2': group('m2')}, None, report, summary)
     assert any('Media "m2" has no row' in w for w in report.warnings)
 
 
@@ -282,9 +365,11 @@ def test_metadata_csv_ids_to_process(tmp_path):
     path = write(tmp_path / 'metadata.csv', content.encode('utf-8'))
     groups = {'m1': group('m1')}
     report = mi.Report()
-    mi.validate_metadata_csv(path, groups, ['m1'], report)
+    summary = mi.Summary()
+    mi.validate_metadata_csv(path, groups, ['m1'], report, summary)
     assert groups['m1'].metadata is not None
     assert not report.errors
+    assert summary.invalid_metadata == 0
 
 
 # -------- annotations
@@ -292,8 +377,9 @@ def test_metadata_csv_ids_to_process(tmp_path):
 
 def test_annotations_no_dir(tmp_path):
     report = mi.Report()
+    summary = mi.Summary()
     groups = {'m1': group('m1')}
-    mi.validate_annotations_csv(tmp_path, groups, None, report)
+    mi.validate_annotations_csv(tmp_path, groups, None, report, summary)
     assert groups['m1'].annotations == []
     assert not report.errors
 
@@ -301,14 +387,16 @@ def test_annotations_no_dir(tmp_path):
 def test_annotations_dir_without_csv(tmp_path):
     (tmp_path / 'annotations').mkdir()
     report = mi.Report()
-    mi.validate_annotations_csv(tmp_path, {'m1': group('m1')}, None, report)
+    summary = mi.Summary()
+    mi.validate_annotations_csv(tmp_path, {'m1': group('m1')}, None, report, summary)
     assert any('No "annotations.csv"' in err for err in report.errors)
 
 
 def test_annotations_missing_columns(tmp_path):
     write(tmp_path / 'annotations' / 'annotations.csv', b'source_id,time\nm1,1\n')
     report = mi.Report()
-    mi.validate_annotations_csv(tmp_path, {'m1': group('m1')}, None, report)
+    summary = mi.Summary()
+    mi.validate_annotations_csv(tmp_path, {'m1': group('m1')}, None, report, summary)
     assert any('missing mandatory columns' in err for err in report.errors)
 
 
@@ -318,7 +406,8 @@ def test_annotations_unknown_column(tmp_path):
         b'source_id,type,time,weird\nm1,slide,1,x\n',
     )
     report = mi.Report()
-    mi.validate_annotations_csv(tmp_path, {'m1': group('m1')}, None, report)
+    summary = mi.Summary()
+    mi.validate_annotations_csv(tmp_path, {'m1': group('m1')}, None, report, summary)
     assert any('unknown column "weird"' in w for w in report.warnings)
 
 
@@ -331,10 +420,12 @@ def test_annotations_valid(tmp_path):
         b'm1,slide,2000,Slide,,,doc.pdf\n',
     )
     report = mi.Report()
+    summary = mi.Summary()
     groups = {'m1': group('m1')}
-    mi.validate_annotations_csv(tmp_path, groups, None, report)
+    mi.validate_annotations_csv(tmp_path, groups, None, report, summary)
     assert len(groups['m1'].annotations) == 2
     assert not report.errors
+    assert summary.unimportable_annotations == 0
 
 
 def test_annotations_csv_ids_to_process(tmp_path):
@@ -344,34 +435,48 @@ def test_annotations_csv_ids_to_process(tmp_path):
     )
     groups = {'m1': group('m1')}
     report = mi.Report()
-    mi.validate_annotations_csv(tmp_path, groups, ['m1'], report)
+    summary = mi.Summary()
+    mi.validate_annotations_csv(tmp_path, groups, ['m1'], report, summary)
     assert len(groups['m1'].annotations) == 1
     assert not report.errors
 
 
-def test_annotations_all_errors(tmp_path):
+def test_annotations_unimportable_dropped(tmp_path):
     write(
         tmp_path / 'annotations' / 'annotations.csv',
         b'source_id,type,time,title,attachment\n'
-        b',chapter,1,,\n'  # empty source_id
-        b'ghost,slide,1,Title,a.pdf\n'  # source_id not in groups
-        b'm1,,1,Title,\n'  # empty type
-        b'm1,chapter,1,,\n'  # chapter without title
-        b'm1,chapter,1,Title,doc.pdf\n'  # chapter with attachment
-        b'm1,slide,abc,Title,\n'  # slide without attachment + non-integer time
-        b'm1,slide,1,Title,missing.pdf\n',  # attachment does not exist
+        b',chapter,1,,\n'  # empty source_id -> dropped
+        b'ghost,slide,1,Title,a.pdf\n'  # source_id not in groups -> dropped
+        b'm1,,1,Title,\n'  # empty type -> dropped
+        b'm1,chapter,1,,\n'  # chapter without title -> dropped
+        b'm1,chapter,1,Title,doc.pdf\n'  # chapter with attachment -> cleaned + kept
+        b'm1,slide,abc,Title,\n'  # slide without attachment -> dropped
+        b'm1,slide,1,Title,missing.pdf\n',  # attachment does not exist -> dropped
     )
     report = mi.Report()
-    mi.validate_annotations_csv(tmp_path, {'m1': group('m1')}, None, report)
-    joined = '\n'.join(report.errors)
-    assert 'empty "source_id"' in joined
-    assert '"source_id" "ghost"' in joined
-    assert '"type" cannot be empty' in joined
-    assert 'requires a\n"title"' in joined or 'requires a "title"' in joined
-    assert 'attachment cannot be linked to "chapter"' in joined
-    assert 'attachment is required for "slide"' in joined
-    assert 'invalid "time" "abc"' in joined
-    assert 'attachment "missing.pdf"' in joined
+    summary = mi.Summary()
+    groups = {'m1': group('m1')}
+    mi.validate_annotations_csv(tmp_path, groups, None, report, summary)
+    assert not report.errors
+    assert summary.unimportable_annotations == 6
+    # Only the cleaned chapter survives, without its (forbidden) attachment.
+    assert len(groups['m1'].annotations) == 1
+    assert groups['m1'].annotations[0]['type'] == 'chapter'
+    assert groups['m1'].annotations[0]['attachment'] == ''
+
+
+def test_annotations_invalid_time_reset(tmp_path):
+    write(
+        tmp_path / 'annotations' / 'annotations.csv',
+        b'source_id,type,time,title\nm1,chapter,abc,Intro\n',
+    )
+    report = mi.Report()
+    summary = mi.Summary()
+    groups = {'m1': group('m1')}
+    mi.validate_annotations_csv(tmp_path, groups, None, report, summary)
+    assert not report.errors
+    assert groups['m1'].annotations[0]['time'] == '0'
+    assert any('reset to 0' in w for w in report.warnings)
 
 
 def test_annotations_too_long_field(tmp_path):
@@ -381,8 +486,12 @@ def test_annotations_too_long_field(tmp_path):
         (f'source_id,type,time,title\nm1,chapter,1000,{long_title}\n').encode('utf-8'),
     )
     report = mi.Report()
-    mi.validate_annotations_csv(tmp_path, {'m1': group('m1')}, None, report)
-    assert any('value too long' in err for err in report.errors)
+    summary = mi.Summary()
+    groups = {'m1': group('m1')}
+    mi.validate_annotations_csv(tmp_path, groups, None, report, summary)
+    assert any('value too long' in w for w in report.warnings)
+    assert len(groups['m1'].annotations[0]['title']) == mi.MAX_FIELD_LENGTH
+    assert not report.errors
 
 
 # -------- ffprobe
@@ -423,19 +532,42 @@ def test_probe_valid(tmp_path):
         assert mi.probe_media(tmp_path / 'x.mp4') is None
 
 
-def test_validate_media_integrity(tmp_path):
+def test_validate_media_integrity_drops_corrupted():
     g = group('m1')
     g.extra_streams[2] = Path('m1_2.mp4')
     g.audio_tracks['eng'] = Path('m1_eng.mp3')
     report = mi.Report()
+    summary = mi.Summary()
+    groups = {'m1': g}
     with mock.patch.object(mi, 'probe_media', return_value='bad'):
-        mi.validate_media_integrity({'m1': g}, report)
-    assert len(report.errors) == 3
-
-    report = mi.Report()
-    with mock.patch.object(mi, 'probe_media', return_value=None):
-        mi.validate_media_integrity({'m1': g}, report)
+        mi.validate_media_integrity(groups, report, summary)
+    # The whole media is dropped as soon as one of its files is corrupted.
+    assert 'm1' not in groups
+    assert summary.unimportable_media[mi.UNIMPORTABLE_CORRUPTED] == ['m1']
     assert not report.errors
+
+
+def test_validate_media_integrity_valid():
+    groups = {'m1': group('m1')}
+    report = mi.Report()
+    summary = mi.Summary()
+    with mock.patch.object(mi, 'probe_media', return_value=None):
+        mi.validate_media_integrity(groups, report, summary)
+    assert set(groups) == {'m1'}
+    assert not report.errors
+    assert not summary.unimportable_media
+
+
+def test_validate_media_integrity_ffprobe_missing():
+    groups = {'m1': group('m1')}
+    report = mi.Report()
+    summary = mi.Summary()
+    with mock.patch.object(mi, 'probe_media', return_value='"ffprobe" command not found; boom'):
+        mi.validate_media_integrity(groups, report, summary)
+    # A missing ffprobe is fatal, media are not dropped.
+    assert set(groups) == {'m1'}
+    assert any('command not found' in err for err in report.errors)
+    assert not summary.unimportable_media
 
 
 # -------- server checks
@@ -447,9 +579,32 @@ def request_error(status_code=500):
 
 def test_server_unreachable():
     report = mi.Report()
+    summary = mi.Summary()
     client = make_client(check_server_exc=RuntimeError('down'))
-    mi.server_checks(client, {}, report)
+    mi.server_checks(client, {}, report, summary)
     assert any('Cannot reach' in err for err in report.errors)
+    client.get_catalog.assert_not_called()
+
+
+def test_server_api_permission_missing():
+    # An API key whose account lacks the required permission aborts the run.
+    client = make_client(
+        api_map={'users/me/': {'user': {'permissions': {'can_change_users': False}}}},
+    )
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, {'a': group_with('a')}, report, summary)
+    assert any('does not have the required permissions' in err for err in report.errors)
+    client.get_catalog.assert_not_called()
+
+
+def test_server_api_check_error():
+    # A failure while testing the API key aborts the run.
+    client = make_client(api_exc={'users/me/': request_error()})
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, {'a': group_with('a')}, report, summary)
+    assert any('testing the API' in err for err in report.errors)
     client.get_catalog.assert_not_called()
 
 
@@ -471,18 +626,24 @@ def test_server_full():
         catalog={'videos': [{'slug': 'taken', 'oid': 'vexist'}], 'channels': [{}]},
         api_map={
             'annotations/types/list/': {'types': [{'id': 1, 'slug': 'other'}]},
-            'users/': {'users': [{'email': 'known@x'}]},
+            'users/': {'users': [{'email': 'known@x', 'id': '25508'}]},
+            'perms/get/': {'global_permissions': {'can_have_personal_channel': {'val': True}}},
         },
     )
     report = mi.Report()
-    mi.server_checks(client, groups, report)
-    errors = '\n'.join(report.errors)
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary)
     warnings = '\n'.join(report.warnings)
+    assert not report.errors
     # An already used slug is only a warning (the media may be re-imported).
     assert 'Slug "taken"' in warnings
     assert 'Slug "free"' not in warnings
-    assert 'Annotation type "custom"' in errors
-    assert 'targets "mscspeaker" but has no' in errors
+    # The annotation using an unknown type is dropped, the internal one is kept.
+    assert [row['type'] for row in groups['a'].annotations] == ['chapter']
+    assert summary.unimportable_annotations == 1
+    # A media targeting "mscspeaker" without a speaker email is dropped.
+    assert 'c' not in groups
+    assert summary.unimportable_media[mi.UNIMPORTABLE_NO_SPEAKER] == ['c']
     # The explicit channels (oid and slug) were looked up on the server.
     channel_calls = [c for c in client.api.call_args_list if c.args[0] == 'channels/get/']
     assert {tuple(c.kwargs['params'].items()) for c in channel_calls} == {
@@ -512,7 +673,8 @@ def test_server_existing_elements():
         },
     )
     report = mi.Report()
-    mi.server_checks(client, {'a': g}, report)
+    summary = mi.Summary()
+    mi.server_checks(client, {'a': g}, report, summary)
     assert g.object_id == 'vexist'
     assert g.existing_elements == ['audio:fre', 'subtitle:fre', 'annotation:chapter:1000']
     assert not report.errors
@@ -527,12 +689,14 @@ def test_server_existing_elements_not_found():
         'annotations/list/': err,
     })
     report = mi.Report()
-    mi.server_checks(client, {'a': g}, report)
+    summary = mi.Summary()
+    mi.server_checks(client, {'a': g}, report, summary)
     assert g.existing_elements == []
     assert not report.errors
 
 
 def test_server_existing_elements_error():
+    # A listing failure no longer aborts the run: it is a warning and the import proceeds.
     g = group_with('a', object_id='vexist')
     err = request_error(status_code=500)
     client = make_client(api_exc={
@@ -541,26 +705,32 @@ def test_server_existing_elements_error():
         'annotations/list/': err,
     })
     report = mi.Report()
-    mi.server_checks(client, {'a': g}, report)
-    assert any('Failed to get audio tracks' in e for e in report.errors)
-    assert any('Failed to get subtitles' in e for e in report.errors)
-    assert any('Failed to get annotations' in e for e in report.errors)
+    summary = mi.Summary()
+    mi.server_checks(client, {'a': g}, report, summary)
+    assert not report.errors
+    warnings = '\n'.join(report.warnings)
+    assert 'Could not list audio tracks' in warnings
+    assert 'Could not list subtitles' in warnings
+    assert 'Could not list annotations' in warnings
 
 
 def test_server_catalog_error():
     client = make_client(catalog_exc=request_error())
     report = mi.Report()
-    mi.server_checks(client, {'a': group_with('a', metadata={'slug': 's'})}, report)
+    summary = mi.Summary()
+    mi.server_checks(client, {'a': group_with('a', metadata={'slug': 's'})}, report, summary)
     assert any('check slugs' in w for w in report.warnings)
 
 
 def test_server_annotation_types_error():
     client = make_client(api_exc={'annotations/types/list/': request_error()})
     report = mi.Report()
-    mi.server_checks(
-        client, {'a': group_with('a', annotations=[{'type': 'custom'}])}, report
-    )
+    summary = mi.Summary()
+    groups = {'a': group_with('a', annotations=[{'type': 'custom'}])}
+    mi.server_checks(client, groups, report, summary)
     assert any('annotation types' in w for w in report.warnings)
+    # The annotations are kept when the types cannot be checked.
+    assert len(groups['a'].annotations) == 1
 
 
 def test_server_speaker_user_missing():
@@ -568,8 +738,72 @@ def test_server_speaker_user_missing():
                                              'speaker_email': 'ghost@x'})}
     client = make_client(api_map={'users/': {'users': []}})
     report = mi.Report()
-    mi.server_checks(client, groups, report)
-    assert any('does not match any Nudgis user' in err for err in report.errors)
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary)
+    # In audit mode the missing user is only reported, not created.
+    assert any('does not exist yet' in w for w in report.warnings)
+    assert not report.errors
+    assert not any(c.args[0] == 'users/add/' for c in client.api.call_args_list)
+
+
+def test_server_speaker_user_created():
+    groups = {'b': group_with('b', metadata={'channel': 'mscspeaker',
+                                             'speaker_email': 'ghost@x'})}
+    client = make_client(api_map={
+        'users/': {'users': []},
+        'users/add/': {'id': '77'},
+        'perms/get/': {'global_permissions': {'can_have_personal_channel': {'val': False}}},
+    })
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary, apply=True)
+    urls = [c.args[0] for c in client.api.call_args_list]
+    # The missing user is created and granted the personal-channel permission.
+    assert 'users/add/' in urls
+    assert 'perms/edit/' in urls
+    assert not report.errors
+
+
+def test_server_speaker_permission_already_granted():
+    groups = {'b': group_with('b', metadata={'channel': 'mscspeaker',
+                                             'speaker_email': 'known@x'})}
+    client = make_client(api_map={
+        'users/': {'users': [{'email': 'known@x', 'id': '25508'}]},
+        'perms/get/': {'global_permissions': {'can_have_personal_channel': {'inherit_val': True}}},
+    })
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary, apply=True)
+    urls = [c.args[0] for c in client.api.call_args_list]
+    assert 'perms/edit/' not in urls
+    assert not report.errors
+
+
+def test_server_speaker_create_error():
+    groups = {'b': group_with('b', metadata={'channel': 'mscspeaker',
+                                             'speaker_email': 'ghost@x'})}
+    client = make_client(
+        api_map={'users/': {'users': []}},
+        api_exc={'users/add/': request_error()},
+    )
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary, apply=True)
+    assert any('Could not create speaker' in w for w in report.warnings)
+    # No permission is checked when the user could not be created.
+    assert not any(c.args[0] == 'perms/get/' for c in client.api.call_args_list)
+
+
+def test_server_speaker_create_without_id():
+    groups = {'b': group_with('b', metadata={'channel': 'mscspeaker',
+                                             'speaker_email': 'ghost@x'})}
+    client = make_client(api_map={'users/': {'users': []}, 'users/add/': {}})
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary, apply=True)
+    # The created user has no id, so no permission is checked.
+    assert not any(c.args[0] == 'perms/get/' for c in client.api.call_args_list)
+    assert not report.errors
 
 
 def test_server_speaker_user_error():
@@ -577,7 +811,8 @@ def test_server_speaker_user_error():
                                              'speaker_email': 'ghost@x'})}
     client = make_client(api_exc={'users/': request_error()})
     report = mi.Report()
-    mi.server_checks(client, groups, report)
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary)
     assert any('Could not check speaker' in w for w in report.warnings)
 
 
@@ -585,8 +820,43 @@ def test_server_channel_missing():
     groups = {'d': group_with('d', metadata={'channel': 'mscid-CID'})}
     client = make_client(api_exc={'channels/get/': request_error()})
     report = mi.Report()
-    mi.server_checks(client, groups, report)
-    assert any('Failed to get channel' in err for err in report.errors)
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary)
+    # An unresolvable channel is cleaned so the media falls back to the folder channel.
+    assert any('could not be resolved' in w for w in report.warnings)
+    assert groups['d'].metadata['channel'] == ''
+    assert not report.errors
+
+
+# -------- ensure_personal_channel
+
+
+def test_ensure_personal_channel_perms_error():
+    client = make_client(api_exc={'perms/get/': request_error()})
+    report = mi.Report()
+    mi.ensure_personal_channel(client, '25508', 'x@x', report, apply=True)
+    assert any('Could not check permissions' in w for w in report.warnings)
+
+
+def test_ensure_personal_channel_audit_reports():
+    client = make_client(api_map={
+        'perms/get/': {'global_permissions': {'can_have_personal_channel': {'val': False}}},
+    })
+    report = mi.Report()
+    mi.ensure_personal_channel(client, '25508', 'x@x', report, apply=False)
+    # In audit mode the missing permission is only reported, not granted.
+    assert any('cannot own a personal channel' in w for w in report.warnings)
+    assert not any(c.args[0] == 'perms/edit/' for c in client.api.call_args_list)
+
+
+def test_ensure_personal_channel_grant_error():
+    client = make_client(
+        api_map={'perms/get/': {'global_permissions': {'can_have_personal_channel': {'val': False}}}},
+        api_exc={'perms/edit/': request_error()},
+    )
+    report = mi.Report()
+    mi.ensure_personal_channel(client, '25508', 'x@x', report, apply=True)
+    assert any('Could not grant' in w for w in report.warnings)
 
 
 # -------- mapping helpers
@@ -605,8 +875,8 @@ def test_build_media_metadata_full():
         'title': 'T', 'slug': 's', 'description': 'd',
         'language': 'fre', 'creation': '2026-01-01T00:00:00', 'company': 'C',
         'company_url': 'cu', 'license': 'L', 'license_url': 'lu', 'validated': 'yes',
-        'unlisted': 'no', 'detect_slides': 'no', 'keywords': 'a,b',
-        'category': 'c1\nc2', 'speaker': 'N1|N2', 'speaker_email': 'e1|e2',
+        'unlisted': 'no', 'detect_slides': 'no', 'keywords': 'a,b', 'category': 'c1\nc2',
+        'speaker': 'N1|N2', 'speaker_name': 'N1|N2', 'speaker_email': 'e1|e2',
     }
 
 
@@ -622,6 +892,17 @@ def test_build_media_metadata_no_row():
 ])
 def test_resolve_channel(main, rel_dir, row, expected):
     assert mi.resolve_channel(main, Path(rel_dir), row) == expected
+
+
+def test_post_annotation_default_content(tmp_path):
+    # A non-internal annotation type with no content gets a placeholder content.
+    client = make_client()
+    row = {'type': 'custom', 'time': '1000', 'title': '', 'content': '',
+           'keywords': '', 'attachment': ''}
+    mi.post_annotation(client, 'oid1', row, tmp_path)
+    _, kwargs = client.api.call_args
+    assert kwargs['data']['type_slug'] == 'custom'
+    assert kwargs['data']['content'] == '-'
 
 
 # -------- import
@@ -647,9 +928,10 @@ def test_import_media(tmp_path):
 
     mapping_file = tmp_path / 'mapping.csv'
     client = make_client()
+    summary = mi.Summary()
 
     mapping = mi.import_media(
-        client, groups, 'Migration', tmp_path, mapping_file, tmp_path / 'temp', ['m1']
+        client, groups, 'Migration', tmp_path, mapping_file, tmp_path / 'temp', summary
     )
 
     assert mapping == {'m1': 'v_migration:m1'}
@@ -664,6 +946,30 @@ def test_import_media(tmp_path):
     assert 'medias/audio/tracks/add/' in called_urls
     assert called_urls.count('annotations/post/') == 2
     assert mapping_file.read_text() == 'source_id,oid\nm1,v_migration:m1\n'
+    assert summary.medias_imported == 1
+    assert summary.medias_existing == 0
+    assert summary.metadata_applied == 1
+    assert summary.audio_tracks_imported == 1
+    assert summary.subtitles_imported == 1
+    assert summary.annotations_imported == 2
+    assert summary.annotations_existing == 0
+    assert summary.annotations_failed == 0
+
+
+def test_import_media_slug_mismatch(tmp_path, caplog):
+    # The server may assign a different slug than requested; this is only warned about.
+    write(tmp_path / 'm1.mp4')
+    g1 = mi.MediaGroup('m1', None, tmp_path / 'm1.mp4', Path('.'))
+    g1.metadata = {'title': 'T', 'slug': 'wanted', 'channel': ''}
+    client = make_client()
+    client.add_media = mock.MagicMock(side_effect=lambda **_kw: {'oid': 'v1', 'slug': 'other'})
+    summary = mi.Summary()
+    with caplog.at_level(logging.WARNING):
+        mapping = mi.import_media(
+            client, {'m1': g1}, 'Migration', tmp_path, tmp_path / 'map.csv', tmp_path / 'temp', summary
+        )
+    assert mapping == {'m1': 'v1'}
+    assert 'did not receive the requested slug' in caplog.text
 
 
 def test_import_media_already_exists(tmp_path):
@@ -680,9 +986,10 @@ def test_import_media_already_exists(tmp_path):
 
     mapping_file = tmp_path / 'mapping.csv'
     client = make_client()
+    summary = mi.Summary()
 
     mapping = mi.import_media(
-        client, {'m1': g1}, 'Migration', tmp_path, mapping_file, tmp_path / 'temp'
+        client, {'m1': g1}, 'Migration', tmp_path, mapping_file, tmp_path / 'temp', summary
     )
 
     assert mapping == {'m1': 'vexist'}
@@ -691,19 +998,31 @@ def test_import_media_already_exists(tmp_path):
     assert 'subtitles/add/' not in called_urls
     assert 'medias/audio/tracks/add/' not in called_urls
     assert 'annotations/post/' not in called_urls
+    assert summary.medias_existing == 1
+    assert summary.medias_imported == 0
+    assert summary.metadata_applied == 0
+    assert summary.audio_tracks_existing == 1
+    assert summary.audio_tracks_imported == 0
+    assert summary.subtitles_existing == 1
+    assert summary.subtitles_imported == 0
+    assert summary.annotations_existing == 1
+    assert summary.annotations_imported == 0
 
 
 def test_import_media_without_metadata_row(tmp_path):
     write(tmp_path / 'm1.mp4')
     g1 = mi.MediaGroup('m1', None, tmp_path / 'm1.mp4', Path('sub'))
     client = make_client()
+    summary = mi.Summary()
     mapping = mi.import_media(
-        client, {'m1': g1}, 'Migration', tmp_path, tmp_path / 'map.csv', tmp_path / 'temp'
+        client, {'m1': g1}, 'Migration', tmp_path, tmp_path / 'map.csv', tmp_path / 'temp', summary
     )
     assert mapping == {'m1': 'v_migration:m1'}
     _, kwargs = client.add_media.call_args
     assert kwargs['title'] == 'm1'
     assert kwargs['channel'] == 'mscpath-Migration/sub'
+    assert summary.medias_imported == 1
+    assert summary.metadata_applied == 0
 
 
 def test_import_media_continues_on_upload_error(tmp_path):
@@ -715,26 +1034,29 @@ def test_import_media_continues_on_upload_error(tmp_path):
     mapping_file = tmp_path / 'mapping.csv'
 
     client = make_client()
+    summary = mi.Summary()
 
     def add_media(**kwargs):
         if kwargs['external_ref'] == 'migration:m1':
             raise mi.NudgisRequestError('upload failed', status_code=500)
-        return {'oid': 'v_' + kwargs['external_ref']}
+        return {'oid': 'v_' + kwargs['external_ref'], 'slug': ''}
 
     client.add_media = mock.MagicMock(side_effect=add_media)
 
     mapping = mi.import_media(
-        client, {'m1': g1, 'm2': g2}, 'Migration', tmp_path, mapping_file, tmp_path / 'temp'
+        client, {'m1': g1, 'm2': g2}, 'Migration', tmp_path, mapping_file, tmp_path / 'temp', summary
     )
 
     # The failed media is excluded from the mapping; the next one is still imported.
     assert mapping == {'m2': 'v_migration:m2'}
     assert client.add_media.call_count == 2
     assert mapping_file.read_text() == 'source_id,oid\nm2,v_migration:m2\n'
+    assert summary.import_failures == 1
+    assert summary.medias_imported == 1
 
 
 def test_import_media_continues_on_linked_element_error(tmp_path):
-    # An error while attaching a linked file is reported but does not stop processing.
+    # A linked-element failure does not prevent the media (and the next ones) from importing.
     write(tmp_path / 'm1.mp4')
     sub_path = write(tmp_path / 'm1_fre.srt')
     write(tmp_path / 'm2.mp4')
@@ -743,6 +1065,7 @@ def test_import_media_continues_on_linked_element_error(tmp_path):
     g2 = mi.MediaGroup('m2', None, tmp_path / 'm2.mp4', Path('.'))
 
     client = make_client()
+    summary = mi.Summary()
 
     def api(url, **kwargs):
         if url == 'subtitles/add/':
@@ -752,12 +1075,67 @@ def test_import_media_continues_on_linked_element_error(tmp_path):
     client.api = mock.MagicMock(side_effect=api)
 
     mapping = mi.import_media(
-        client, {'m1': g1, 'm2': g2}, 'Migration', tmp_path, tmp_path / 'map.csv', tmp_path / 'temp'
+        client, {'m1': g1, 'm2': g2}, 'Migration', tmp_path, tmp_path / 'map.csv',
+        tmp_path / 'temp', summary,
     )
 
-    # m1 failed while attaching its subtitle, so it is not recorded as imported; m2 is.
-    assert set(mapping) == {'m2'}
+    # m1's upload succeeded, so it is counted as imported even though its subtitle failed.
+    assert set(mapping) == {'m1', 'm2'}
     assert client.add_media.call_count == 2
+    assert summary.import_failures == 0
+    assert summary.medias_imported == 2
+    assert summary.subtitles_failed == 1
+    assert summary.subtitles_imported == 0
+
+
+def test_import_media_element_failures(tmp_path):
+    # Each linked element failure is isolated and counted; the media is still imported.
+    write(tmp_path / 'm1.mp4')
+    sub_path = write(tmp_path / 'm1_fre.srt')
+    audio_path = write(tmp_path / 'm1_eng.mp3')
+    g1 = mi.MediaGroup('m1', None, tmp_path / 'm1.mp4', Path('.'))
+    g1.subtitles['fre'] = sub_path
+    g1.audio_tracks['eng'] = audio_path
+    g1.annotations = [{'type': 'chapter', 'time': '1000', 'title': 'Intro'}]
+
+    client = make_client()
+    summary = mi.Summary()
+
+    def api(url, **kwargs):
+        if url in ('medias/audio/tracks/add/', 'subtitles/add/', 'annotations/post/'):
+            raise mi.NudgisRequestError('boom', status_code=500)
+        return {}
+
+    client.api = mock.MagicMock(side_effect=api)
+
+    mapping = mi.import_media(
+        client, {'m1': g1}, 'Migration', tmp_path, tmp_path / 'map.csv', tmp_path / 'temp', summary
+    )
+
+    # The media itself was created, so it is imported despite every element failing.
+    assert mapping == {'m1': 'v_migration:m1'}
+    assert summary.medias_imported == 1
+    assert summary.import_failures == 0
+    assert summary.audio_tracks_failed == 1
+    assert summary.subtitles_failed == 1
+    assert summary.annotations_failed == 1
+
+
+def test_import_media_skips_malformed_annotation(tmp_path):
+    # A row missing its type/time is defensively skipped and not counted.
+    write(tmp_path / 'm1.mp4')
+    g1 = mi.MediaGroup('m1', None, tmp_path / 'm1.mp4', Path('.'))
+    g1.annotations = [{'title': 'no type nor time'}]
+    client = make_client()
+    summary = mi.Summary()
+    mapping = mi.import_media(
+        client, {'m1': g1}, 'Migration', tmp_path, tmp_path / 'map.csv', tmp_path / 'temp', summary
+    )
+    assert mapping == {'m1': 'v_migration:m1'}
+    called_urls = [call.args[0] for call in client.api.call_args_list]
+    assert 'annotations/post/' not in called_urls
+    assert summary.annotations_imported == 0
+    assert summary.annotations_failed == 0
 
 
 def test_import_media_multistream(tmp_path):
@@ -769,6 +1147,7 @@ def test_import_media_multistream(tmp_path):
     g.extra_streams[2] = second
 
     client = make_client()
+    summary = mi.Summary()
     captured = {}
 
     def fake_compose(inputs, output, ffmpeg='ffmpeg', ffprobe='ffprobe'):
@@ -780,7 +1159,7 @@ def test_import_media_multistream(tmp_path):
 
     with mock.patch.object(mi, 'compose_streams', side_effect=fake_compose):
         mapping = mi.import_media(
-            client, {'multi': g}, 'Migration', tmp_path, tmp_path / 'map.csv', temp_dir,
+            client, {'multi': g}, 'Migration', tmp_path, tmp_path / 'map.csv', temp_dir, summary,
             ffmpeg='/usr/bin/ffmpeg', ffprobe='/usr/bin/ffprobe',
         )
 
@@ -793,6 +1172,8 @@ def test_import_media_multistream(tmp_path):
     assert not temp_file.exists()  # the temporary file is removed after a successful upload
     assert not temp_file.with_suffix('.json').exists()  # the layout preset is cleaned up too
     assert mapping == {'multi': 'v_migration:multi'}
+    assert summary.merged_videos == 1
+    assert summary.medias_imported == 1
 
 
 def test_import_media_multistream_skipped_when_exists(tmp_path):
@@ -800,13 +1181,17 @@ def test_import_media_multistream_skipped_when_exists(tmp_path):
     g = mi.MediaGroup('multi', 'vexist', tmp_path / 'multi.mp4', Path('.'))
     g.extra_streams[2] = tmp_path / 'multi_2.mp4'
     client = make_client()
+    summary = mi.Summary()
     with mock.patch.object(mi, 'compose_streams') as compose:
         mapping = mi.import_media(
-            client, {'multi': g}, 'Migration', tmp_path, tmp_path / 'map.csv', tmp_path / 'temp'
+            client, {'multi': g}, 'Migration', tmp_path, tmp_path / 'map.csv',
+            tmp_path / 'temp', summary,
         )
     compose.assert_not_called()
     client.add_media.assert_not_called()
     assert mapping == {'multi': 'vexist'}
+    assert summary.medias_existing == 1
+    assert summary.merged_videos == 0
 
 
 def test_import_media_multistream_compose_error(tmp_path):
@@ -815,12 +1200,56 @@ def test_import_media_multistream_compose_error(tmp_path):
     g = mi.MediaGroup('multi', None, main, Path('.'))
     g.extra_streams[2] = write(tmp_path / 'multi_2.mp4')
     client = make_client()
+    summary = mi.Summary()
     with mock.patch.object(mi, 'compose_streams', side_effect=RuntimeError('ffmpeg failed')):
         mapping = mi.import_media(
-            client, {'multi': g}, 'Migration', tmp_path, tmp_path / 'map.csv', tmp_path / 'temp'
+            client, {'multi': g}, 'Migration', tmp_path, tmp_path / 'map.csv',
+            tmp_path / 'temp', summary,
         )
     assert mapping == {}
     client.add_media.assert_not_called()
+    assert summary.import_failures == 1
+    assert summary.merged_videos == 0
+
+
+# -------- planning / report
+
+
+def test_count_planned():
+    groups = {
+        'new': group_with('new', metadata={'title': 'T'},
+                          annotations=[{'type': 'chapter', 'time': '0'}]),
+        'existing': group_with(
+            'existing', object_id='vexist',
+            annotations=[{'type': 'chapter', 'time': '1000'}],
+            existing_elements=['audio:eng', 'subtitle:fre', 'annotation:chapter:1000'],
+        ),
+    }
+    groups['new'].extra_streams[2] = Path('new_2.mp4')
+    groups['new'].audio_tracks['eng'] = Path('new_eng.mp3')
+    groups['new'].subtitles['fre'] = Path('new_fre.srt')
+    groups['existing'].audio_tracks['eng'] = Path('existing_eng.mp3')
+    groups['existing'].subtitles['fre'] = Path('existing_fre.srt')
+    summary = mi.Summary()
+    mi.count_planned(groups, summary)
+    assert summary.medias_imported == 1
+    assert summary.medias_existing == 1
+    assert summary.merged_videos == 1
+    assert summary.metadata_applied == 1
+    assert summary.audio_tracks_imported == 1
+    assert summary.audio_tracks_existing == 1
+    assert summary.subtitles_imported == 1
+    assert summary.subtitles_existing == 1
+    assert summary.annotations_imported == 1
+    assert summary.annotations_existing == 1
+
+
+def test_print_summary_smoke():
+    summary = mi.Summary(medias_imported=2, import_failures=1)
+    summary.drop_media('x', mi.UNIMPORTABLE_CORRUPTED)
+    # Should not raise in either mode.
+    mi.print_summary(summary, applied=True)
+    mi.print_summary(summary, applied=False)
 
 
 # -------- orchestrator
@@ -865,8 +1294,27 @@ def test_mass_import_missing_source_dir(tmp_path, patched_client):
     ]) == 1
 
 
+@pytest.mark.parametrize('channel, expected', [
+    ('Migration', 0),
+    ('mscpath-Migration/sub', 0),
+    ('c123456789012345678', 0),  # only 19 chars, too short to be an object id
+    ('c-1234567890123456789', 0),  # right length but not alphanumeric
+    ('mscid-c1234567890123456789', 1),
+    ('c1234567890123456789', 1),
+    ('cAbCdEfGhIjKlMnOpQrS', 1),
+])
+def test_mass_import_channel_object_id(tmp_path, patched_client, channel, expected):
+    # The main channel must be a title or an "mscpath-...", an object id is rejected.
+    build_valid_tree(tmp_path)
+    assert mi.mass_import([
+        '--conf', 'conf.json', '--source-dir', str(tmp_path), '--channel', channel,
+    ]) == expected
+
+
 def test_mass_import_audit_failure(tmp_path, patched_client):
-    write(tmp_path / 'metadata.csv', (METADATA_HEADER + '\nm1,Title,,,,,,,,,,,,,,,,\n').encode())
+    # A structurally broken metadata.csv (missing mandatory columns) aborts the run.
+    write(tmp_path / 'm1.mp4')
+    write(tmp_path / 'metadata.csv', b'foo,bar\n1,2\n')
     assert mi.mass_import([
         '--conf', 'conf.json', '--source-dir', str(tmp_path), '--channel', 'Migration',
     ]) == 1
