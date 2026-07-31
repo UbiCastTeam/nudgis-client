@@ -8,12 +8,13 @@ It scans a source directory laid out according to the migration standard and eit
 
 - audits it (default behaviour, no ``--apply``): it checks that the file tree is
   correctly structured, that the media files are valid (using ``ffprobe``), that the
-  ``metadata.csv`` and ``annotations.csv`` files are well formed and consistent with the
-  files on disk, and it runs a few server-side checks (slug uniqueness, annotation types,
-  speaker resolution, explicit channels);
+  ``metadata.csv``, ``annotations.csv`` and ``channels.csv`` files are well formed and
+  consistent with the files on disk, and it runs a few server-side checks (slug uniqueness,
+  annotation types, speaker resolution, explicit channels);
 - imports it (with ``--apply``): it uploads each media (reusing the folder tree as a
   channel tree), attaches subtitles and additional audio tracks, applies the metadata and
-  the annotations, and writes a ``source_id`` -> ``oid`` mapping file.
+  the annotations, applies the channel metadata and writes a ``source_id`` -> ``oid``
+  mapping file.
 
 Problems found during the audit never abort the whole run: recoverable issues are cleaned
 up in place (invalid optional fields are dropped, over-long values are truncated) and the
@@ -26,6 +27,11 @@ tree) still abort the run.
 Multi-stream (side-by-side) media are combined into a single video with ``ffmpeg`` during
 the import (see ``compose_multistream.py``); the temporary combined file is written under
 ``--temp-dir`` and removed once the upload succeeds.
+
+The channel metadata listed in ``channels.csv`` are applied at the very end of the import,
+once every media (and therefore every channel of the folder tree) has been created. The
+``path`` of a channel is resolved from the root of the Nudgis catalog, so it must include the
+title of the main migration channel; the channels that do not exist yet are created.
 
 Example:
 
@@ -68,6 +74,8 @@ SUBTITLE_EXTENSIONS = {'.srt', '.vtt'}
 
 # Name of the metadata file (expected at the root of the source directory).
 METADATA_FILENAME = 'metadata.csv'
+# Name of the channels metadata file (expected at the root of the source directory).
+CHANNELS_FILENAME = 'channels.csv'
 # Name of the annotations directory and file (expected at the root of the source directory).
 ANNOTATIONS_DIRNAME = 'annotations'
 ANNOTATIONS_FILENAME = 'annotations.csv'
@@ -79,6 +87,9 @@ METADATA_KNOWN_FIELDS = {
     'creation', 'speaker_name', 'speaker_email', 'company_name', 'company_url',
     'license_name', 'license_url', 'channel', 'validated', 'unlisted', 'detect_slides',
 }
+# Columns of channels.csv. Only the channel path is mandatory.
+CHANNELS_MANDATORY_FIELDS = {'path'}
+CHANNELS_KNOWN_FIELDS = {'path', 'description', 'reference'}
 # Columns of annotations.csv.
 ANNOTATIONS_MANDATORY_FIELDS = {'source_id', 'type'}
 ANNOTATIONS_KNOWN_FIELDS = {
@@ -128,6 +139,25 @@ class MediaGroup:
     @property
     def external_ref(self) -> str:
         return f'migration:{self.source_id}'
+
+
+@dataclass
+class ChannelUpdate:
+    """
+    The metadata of a single channel, as described by a ``channels.csv`` row.
+
+    ``path`` holds the titles of all the channels making up the path of the channel, from the
+    root of the Nudgis catalog down to it.
+    """
+
+    path: list[str]
+    description: str = ''
+    reference: str = ''
+    object_id: str | None = None
+
+    @property
+    def display_path(self) -> str:
+        return '/'.join(self.path)
 
 
 @dataclass
@@ -181,9 +211,13 @@ class Summary:
     annotations_existing: int = 0
     annotations_imported: int = 0
     annotations_failed: int = 0
+    # Channels whose metadata have been applied / could not be applied.
+    channels_updated: int = 0
+    channels_failed: int = 0
     # Unprocessable content.
     unimportable_media: dict[str, list[str]] = field(default_factory=dict)
     invalid_metadata: int = 0
+    invalid_channels: int = 0
     unimportable_annotations: int = 0
     import_failures: int = 0
 
@@ -198,9 +232,10 @@ def run_audit(
     ids_to_process: list[str] | None = None,
     ffprobe: str = 'ffprobe',
     apply: bool = False,
-) -> tuple[Report, Summary, dict[str, MediaGroup]]:
+) -> tuple[Report, Summary, dict[str, MediaGroup], list[ChannelUpdate]]:
     """
-    Run the whole audit phase and return the report, the summary and the media groups.
+    Run the whole audit phase and return the report, the summary, the media groups and the
+    channel metadata.
 
     Instead of aborting on the first problem, the audit cleans up recoverable issues in
     place and drops the individual media, metadata entries or annotations that cannot be
@@ -216,9 +251,10 @@ def run_audit(
     groups = scan_source_tree(source_dir, ids_to_process, report, summary)
     validate_metadata_csv(source_dir / METADATA_FILENAME, groups, ids_to_process, report, summary)
     validate_annotations_csv(source_dir, groups, ids_to_process, report, summary)
+    channels = validate_channels_csv(source_dir / CHANNELS_FILENAME, report, summary)
     validate_media_integrity(groups, report, summary, ffprobe=ffprobe)
-    server_checks(ngc, groups, report, summary, apply=apply)
-    return report, summary, groups
+    server_checks(ngc, groups, report, summary, channels=channels, apply=apply)
+    return report, summary, groups, channels
 
 
 def scan_source_tree(
@@ -230,10 +266,10 @@ def scan_source_tree(
     """
     Walk ``source_dir`` and group the files by media (source id).
 
-    The ``annotations`` directory and the ``metadata.csv`` file are ignored here; they are
-    validated separately. Media that cannot be imported (a video with a too-long name or a
-    duplicate source id) are dropped and counted in ``summary``; auxiliary files that cannot
-    be attached are simply ignored with a warning.
+    The ``annotations`` directory and the ``metadata.csv`` and ``channels.csv`` files are
+    ignored here; they are validated separately. Media that cannot be imported (a video with
+    a too-long name or a duplicate source id) are dropped and counted in ``summary``;
+    auxiliary files that cannot be attached are simply ignored with a warning.
     """
     logger.info('Scanning source tree "%s".', source_dir)
     annotations_dir = source_dir / ANNOTATIONS_DIRNAME
@@ -243,7 +279,7 @@ def scan_source_tree(
     for path in sorted(source_dir.rglob('*')):
         if not path.is_file():
             continue
-        if path == source_dir / METADATA_FILENAME:
+        if path in (source_dir / METADATA_FILENAME, source_dir / CHANNELS_FILENAME):
             continue
         if annotations_dir in path.parents or path == annotations_dir:
             continue
@@ -504,6 +540,101 @@ def validate_metadata_csv(
             )
 
 
+def validate_channels_csv(
+    csv_path: Path,
+    report: Report,
+    summary: Summary,
+) -> list[ChannelUpdate]:
+    """
+    Validate ``channels.csv`` and return the channel metadata to apply after the import.
+
+    The file is optional; if it is missing, no channel metadata is applied. A row that cannot
+    be applied at all (empty, malformed or duplicate ``path``, no metadata to apply) is
+    dropped and counted as an invalid channel entry; an unusable ``reference`` (too long or
+    already used) is dropped on its own so that the description can still be applied.
+    """
+    logger.info('Validating channels CSV "%s".', csv_path)
+    if not csv_path.is_file():
+        report.warning(f'No "{CHANNELS_FILENAME}" file found at "{csv_path}".')
+        return []
+
+    channels: list[ChannelUpdate] = []
+    with csv_path.open('r', encoding='utf-8', newline='') as csvfile:
+        reader = csv.DictReader(csvfile, delimiter=',', quotechar='"')
+
+        header = reader.fieldnames or []
+        missing = CHANNELS_MANDATORY_FIELDS - set(header)
+        if missing:
+            report.error(
+                f'"{CHANNELS_FILENAME}" is missing mandatory columns: '
+                f'{", ".join(sorted(missing))}.'
+            )
+            return []
+
+        for unknown in sorted(set(header) - CHANNELS_KNOWN_FIELDS):
+            report.warning(f'"{CHANNELS_FILENAME}" has an unknown column "{unknown}".')
+
+        seen_paths: set[str] = set()
+        references: dict[str, str] = {}
+        for line, row in enumerate(reader, start=2):
+            path = (row.get('path') or '').strip().strip('/')
+            titles = [title.strip() for title in path.split('/')] if path else []
+            if not titles or not all(titles):
+                report.warning(
+                    f'{CHANNELS_FILENAME}:{line}: empty or invalid "path", row ignored.'
+                )
+                summary.invalid_channels += 1
+                continue
+            if any(len(title) > MAX_FIELD_LENGTH for title in titles):
+                # Truncating a title would target another channel, so the whole row is dropped.
+                report.warning(
+                    f'{CHANNELS_FILENAME}:{line}: a channel title of "{path}" is longer than '
+                    f'{MAX_FIELD_LENGTH} characters, row ignored.'
+                )
+                summary.invalid_channels += 1
+                continue
+            display_path = '/'.join(titles)
+            if display_path in seen_paths:
+                report.warning(
+                    f'{CHANNELS_FILENAME}:{line}: duplicate "path" "{display_path}", row ignored.'
+                )
+                summary.invalid_channels += 1
+                continue
+            seen_paths.add(display_path)
+
+            reference = (row.get('reference') or '').strip()
+            if reference and len(reference) > MAX_FIELD_LENGTH:
+                # A reference identifies an external element (for example a course of an LMS),
+                # so a truncated one would point to the wrong element: it is dropped instead.
+                report.warning(
+                    f'{CHANNELS_FILENAME}:{line}: "reference" value too long, ignored (at most '
+                    f'{MAX_FIELD_LENGTH} characters).'
+                )
+                reference = ''
+            elif reference and reference in references:
+                report.warning(
+                    f'{CHANNELS_FILENAME}:{line}: "reference" "{reference}" already used by '
+                    f'"{references[reference]}", ignored.'
+                )
+                reference = ''
+            elif reference:
+                references[reference] = display_path
+
+            description = (row.get('description') or '').strip()
+            if not description and not reference:
+                report.warning(
+                    f'{CHANNELS_FILENAME}:{line}: no metadata to apply to "{display_path}", '
+                    'row ignored.'
+                )
+                summary.invalid_channels += 1
+                continue
+
+            channels.append(
+                ChannelUpdate(path=titles, description=description, reference=reference)
+            )
+    return channels
+
+
 def validate_annotations_csv(
     source_dir: Path,
     groups: dict[str, MediaGroup],
@@ -689,6 +820,7 @@ def server_checks(
     groups: dict[str, MediaGroup],
     report: Report,
     summary: Summary,
+    channels: list[ChannelUpdate] | None = None,
     apply: bool = False,
 ) -> None:
     """
@@ -696,9 +828,10 @@ def server_checks(
 
     Annotations referencing an unknown type are dropped, media targeting ``mscspeaker``
     without a ``speaker_email`` are dropped, and media with an unresolvable explicit channel
-    fall back to the folder-based channel. When ``apply`` is true, missing speaker users are
-    created and granted the personal-channel permission; otherwise the audit only reports
-    what would be done.
+    fall back to the folder-based channel. The ``channels.csv`` entries are resolved against
+    the catalog to report the channels that do not exist yet and the references already used.
+    When ``apply`` is true, missing speaker users are created and granted the personal-channel
+    permission; otherwise the audit only reports what would be done.
     """
     try:
         ngc.check_server()
@@ -717,12 +850,13 @@ def server_checks(
             report.error('The user account of the given API key does not have the required permissions.')
             return
 
-    # Slug and external ref uniqueness against the existing catalog.
-    if groups:
+    # Slug and external ref uniqueness against the existing catalog, and resolution of the
+    # channels listed in "channels.csv".
+    if groups or channels:
         try:
             catalog = ngc.get_catalog(fmt='flat')
         except NudgisRequestError as err:
-            report.warning(f'Could not fetch the catalog to check slugs: {err}')
+            report.warning(f'Could not fetch the catalog to check slugs and channels: {err}')
         else:
             existing_slugs = {
                 obj['slug']: obj['oid']
@@ -749,6 +883,25 @@ def server_checks(
                             f'Slug "{slug}" (media "{group.source_id}") already exists on the server'
                             f' (used by "{existing_slugs[slug]}").'
                         )
+            channel_paths = build_channel_paths(catalog)
+            channel_refs = {
+                obj['external_ref']: obj['oid']
+                for obj in catalog.get('channels', [])
+                if obj.get('external_ref')
+            }
+            for update in channels or []:
+                update.object_id = channel_paths.get(update.display_path)
+                if update.object_id is None:
+                    report.warning(
+                        f'Channel "{update.display_path}" does not exist yet; it would be '
+                        'created on import.'
+                    )
+                owner = channel_refs.get(update.reference)
+                if update.reference and owner and owner != update.object_id:
+                    report.warning(
+                        f'Reference "{update.reference}" (channel "{update.display_path}") is '
+                        f'already used by another channel ("{owner}").'
+                    )
 
     # Annotation types existence: drop the annotations referencing an unknown type.
     used_types = {
@@ -1113,12 +1266,105 @@ def import_media(
     return mapping
 
 
-def count_planned(groups: dict[str, MediaGroup], summary: Summary) -> None:
+def build_channel_paths(catalog: dict) -> dict[str, str]:
+    """
+    Build a "channel path" -> ``oid`` map from a flat catalog.
+
+    The path of a channel is made of the titles of all the channels from the root of the
+    catalog down to it, separated by "/" (the format used in ``channels.csv``).
+    """
+    by_oid = {obj['oid']: obj for obj in catalog.get('channels', []) if obj.get('oid')}
+    paths: dict[str, str] = {}
+    for oid, obj in by_oid.items():
+        titles: list[str] = []
+        seen: set[str] = set()
+        current = obj
+        while current is not None and current['oid'] not in seen:
+            seen.add(current['oid'])
+            titles.append(current.get('title') or '')
+            current = by_oid.get(current.get('parent_oid'))
+        paths.setdefault('/'.join(reversed(titles)), oid)
+    return paths
+
+
+def ensure_channel(ngc: NudgisClient, titles: list[str], paths: dict[str, str]) -> str:
+    """
+    Return the oid of the channel at the given path, creating the missing levels.
+
+    ``paths`` is the "channel path" -> ``oid`` map of the existing channels (see
+    :func:`build_channel_paths`); it is updated with the channels created along the way.
+    """
+    parent_oid = ''
+    for index, title in enumerate(titles):
+        path = '/'.join(titles[:index + 1])
+        oid = paths.get(path)
+        if oid is None:
+            data = {'title': title}
+            if parent_oid:
+                data['parent'] = parent_oid
+            oid = ngc.api('channels/add/', method='post', data=data)['oid']
+            paths[path] = oid
+            logger.info('Created channel "%s" with oid "%s".', path, oid)
+        parent_oid = oid
+    return parent_oid
+
+
+def apply_channels_metadata(
+    ngc: NudgisClient,
+    channels: list[ChannelUpdate],
+    summary: Summary,
+) -> None:
+    """
+    Apply the ``channels.csv`` metadata, creating the channels that do not exist yet.
+
+    This is the last step of the import so that the channels created while uploading the media
+    (from the source folder tree) can be targeted by their path. The values of the CSV file
+    always take precedence over the values already set on the server. A channel that cannot be
+    resolved or updated is counted as a failure and does not prevent the next ones from being
+    updated.
+    """
+    if not channels:
+        return
+    try:
+        catalog = ngc.get_catalog(fmt='flat')
+    except NudgisRequestError as err:
+        logger.error('Could not fetch the catalog to resolve the channel paths: %s', err)
+        summary.channels_failed += len(channels)
+        return
+    paths = build_channel_paths(catalog)
+    for update in channels:
+        try:
+            oid = ensure_channel(ngc, update.path, paths)
+            data = {'oid': oid}
+            if update.description:
+                data['description'] = update.description
+            if update.reference:
+                data['external_ref'] = update.reference
+            logger.info('Applying metadata to channel "%s" ("%s").', update.display_path, oid)
+            ngc.api('channels/edit/', method='post', data=data)
+            update.object_id = oid
+            summary.channels_updated += 1
+        except (NudgisRequestError, RuntimeError) as err:
+            logger.error(
+                'Failed to apply metadata to channel "%s": %s', update.display_path, err
+            )
+            summary.channels_failed += 1
+    logger.info(
+        'Channel metadata import complete: %s applied, %s failed.',
+        summary.channels_updated, summary.channels_failed,
+    )
+
+
+def count_planned(
+    groups: dict[str, MediaGroup],
+    summary: Summary,
+    channels: list[ChannelUpdate] | None = None,
+) -> None:
     """
     Fill in the "correctly processed" counters of ``summary`` for a dry-run.
 
     Nothing is uploaded; the counters reflect what a subsequent ``--apply`` run would do
-    with the media that survived the audit.
+    with the media that survived the audit and the channels listed in ``channels.csv``.
     """
     for group in groups.values():
         if group.object_id:
@@ -1145,6 +1391,7 @@ def count_planned(groups: dict[str, MediaGroup], summary: Summary) -> None:
                 summary.annotations_existing += 1
             else:
                 summary.annotations_imported += 1
+    summary.channels_updated += len(channels or [])
 
 
 def print_summary(summary: Summary, applied: bool) -> None:
@@ -1173,6 +1420,9 @@ def print_summary(summary: Summary, applied: bool) -> None:
         lines.append(f'  - {label} already existing: {existing}')
         if applied:
             lines.append(f'  - {label} failed: {failed}')
+    lines.append(f'  - Channel metadata entries {applied_label}: {summary.channels_updated}')
+    if applied:
+        lines.append(f'  - Channel metadata entries failed: {summary.channels_failed}')
     lines += [
         '',
         'Unprocessable content:',
@@ -1181,6 +1431,7 @@ def print_summary(summary: Summary, applied: bool) -> None:
     for reason in sorted(summary.unimportable_media):
         lines.append(f'      - {reason}: {len(summary.unimportable_media[reason])}')
     lines.append(f'  - Invalid metadata entries: {summary.invalid_metadata}')
+    lines.append(f'  - Invalid channel entries: {summary.invalid_channels}')
     lines.append(f'  - Unimportable annotations: {summary.unimportable_annotations}')
     if applied:
         lines.append(f'  - Media that could not be created: {summary.import_failures}')
@@ -1372,7 +1623,7 @@ def mass_import(sys_args: list[str]) -> int:
     ngc = NudgisClient(args.conf, setup_logging=False)
     ngc.conf['TIMEOUT'] = max(600, ngc.conf['TIMEOUT'])
 
-    report, summary, groups = run_audit(
+    report, summary, groups, channels = run_audit(
         source_dir, ngc, ids_to_process, ffprobe=args.ffprobe, apply=args.apply
     )
 
@@ -1400,12 +1651,15 @@ def mass_import(sys_args: list[str]) -> int:
             ffmpeg=args.ffmpeg,
             ffprobe=args.ffprobe,
         )
+        # The channel metadata are applied last so that the channels created while importing
+        # the media can be targeted by their path.
+        apply_channels_metadata(ngc, channels, summary)
     else:
         logger.info(
             'Audit succeeded for %s media (dry-run). Re-run with "--apply" to import.',
             len(groups),
         )
-        count_planned(groups, summary)
+        count_planned(groups, summary, channels=channels)
 
     print_summary(summary, applied=args.apply)
     return 0
