@@ -62,6 +62,9 @@ def make_client(
         # By default the API key has the permissions required by server_checks.
         if url == 'users/me/':
             return {'user': {'permissions': {'can_change_users': True}}}
+        # Channel creation happens when applying the "channels.csv" metadata.
+        if url == 'channels/add/':
+            return {'oid': 'c_new'}
         return {}
 
     client.api = mock.MagicMock(side_effect=api)
@@ -73,6 +76,7 @@ METADATA_HEADER = (
     'speaker_name,speaker_email,company_name,company_url,license_name,license_url,'
     'channel,validated,unlisted,detect_slides'
 )
+CHANNELS_HEADER = 'path,description,reference'
 
 
 # -------- scan
@@ -84,6 +88,7 @@ def test_scan_basic(tmp_path):
     write(tmp_path / 'm1_eng.mp3')
     write(tmp_path / 'sub' / 'm2.mp4')
     write(tmp_path / 'metadata.csv', b'ignored')
+    write(tmp_path / 'channels.csv', b'ignored')
     write(tmp_path / 'annotations' / 'annotations.csv', b'ignored')
     write(tmp_path / 'readme.txt')  # unexpected file -> warning
 
@@ -96,7 +101,9 @@ def test_scan_basic(tmp_path):
     assert set(groups['m1'].audio_tracks) == {'eng'}
     assert groups['m2'].rel_dir == Path('sub')
     assert not report.errors
-    assert any('Ignoring unexpected file' in w for w in report.warnings)
+    # The CSV files of the migration standard are validated separately, not scanned here.
+    assert sum('Ignoring unexpected file' in w for w in report.warnings) == 1
+    assert any('readme.txt' in w for w in report.warnings)
 
 
 def test_scan_filename_too_long(tmp_path):
@@ -370,6 +377,109 @@ def test_metadata_csv_ids_to_process(tmp_path):
     assert groups['m1'].metadata is not None
     assert not report.errors
     assert summary.invalid_metadata == 0
+
+
+# -------- channels
+
+
+def test_channels_missing_file(tmp_path):
+    report = mi.Report()
+    summary = mi.Summary()
+    assert mi.validate_channels_csv(tmp_path / 'channels.csv', report, summary) == []
+    assert any('No "channels.csv"' in w for w in report.warnings)
+    assert not report.errors
+
+
+def test_channels_missing_columns(tmp_path):
+    path = write(tmp_path / 'channels.csv', b'foo,bar\n1,2\n')
+    report = mi.Report()
+    summary = mi.Summary()
+    assert mi.validate_channels_csv(path, report, summary) == []
+    # A structurally broken CSV is a fatal error.
+    assert any('missing mandatory columns' in err for err in report.errors)
+
+
+def test_channels_unknown_column(tmp_path):
+    path = write(tmp_path / 'channels.csv', b'path,description,weird\nCourse A,Desc,x\n')
+    report = mi.Report()
+    summary = mi.Summary()
+    channels = mi.validate_channels_csv(path, report, summary)
+    assert len(channels) == 1
+    assert any('unknown column "weird"' in w for w in report.warnings)
+
+
+def test_channels_valid(tmp_path):
+    content = (
+        CHANNELS_HEADER + '\n'
+        '"Course A/Year 1","<p>My description</p>",lti:moodle.example.local:245\n'
+        ' Course B / Year 2 ,,lti:moodle.example.local:246\n'  # surrounding spaces are stripped
+        '/Course C/,Only a description,\n'  # leading and trailing separators are stripped
+    )
+    path = write(tmp_path / 'channels.csv', content.encode('utf-8'))
+    report = mi.Report()
+    summary = mi.Summary()
+    channels = mi.validate_channels_csv(path, report, summary)
+    assert [channel.path for channel in channels] == [
+        ['Course A', 'Year 1'], ['Course B', 'Year 2'], ['Course C'],
+    ]
+    assert channels[0].description == '<p>My description</p>'
+    assert channels[0].reference == 'lti:moodle.example.local:245'
+    assert channels[0].display_path == 'Course A/Year 1'
+    assert channels[1].description == ''
+    assert channels[2].reference == ''
+    assert not report.errors
+    assert summary.invalid_channels == 0
+
+
+def test_channels_invalid_rows_dropped(tmp_path):
+    long_title = 'T' * (mi.MAX_FIELD_LENGTH + 1)
+    content = (
+        CHANNELS_HEADER + '\n'
+        ',Desc,\n'  # empty path
+        'Course A//Year 1,Desc,\n'  # empty channel title in the path
+        f'Course A/{long_title},Desc,\n'  # channel title too long
+        'Course A,Desc,\n'  # valid row
+        'Course A,Other desc,\n'  # duplicate path
+        'Course B,,\n'  # nothing to apply
+    )
+    path = write(tmp_path / 'channels.csv', content.encode('utf-8'))
+    report = mi.Report()
+    summary = mi.Summary()
+    channels = mi.validate_channels_csv(path, report, summary)
+    assert [channel.path for channel in channels] == [['Course A']]
+    assert channels[0].description == 'Desc'
+    assert summary.invalid_channels == 5
+    assert not report.errors
+    warnings = '\n'.join(report.warnings)
+    assert 'empty or invalid "path"' in warnings
+    assert f'longer than {mi.MAX_FIELD_LENGTH} characters' in warnings
+    assert 'duplicate "path"' in warnings
+    assert 'no metadata to apply' in warnings
+
+
+def test_channels_unusable_reference_dropped(tmp_path):
+    long_reference = 'lti:moodle.example.local:' + '1' * mi.MAX_FIELD_LENGTH
+    content = (
+        CHANNELS_HEADER + '\n'
+        f'Course A,Desc,{long_reference}\n'  # too long to be stored
+        'Course B,Desc,any free-form value\n'  # the reference format is not constrained
+        'Course C,Desc,lti:moodle.example.local:245\n'
+        'Course D,Desc,lti:moodle.example.local:245\n'  # reference already used
+    )
+    path = write(tmp_path / 'channels.csv', content.encode('utf-8'))
+    report = mi.Report()
+    summary = mi.Summary()
+    channels = mi.validate_channels_csv(path, report, summary)
+    # The rows are kept (their description can be applied), only the reference is dropped.
+    assert [channel.reference for channel in channels] == [
+        '', 'any free-form value', 'lti:moodle.example.local:245', '',
+    ]
+    assert summary.invalid_channels == 0
+    assert not report.errors
+    warnings = '\n'.join(report.warnings)
+    assert '"reference" value too long' in warnings
+    assert f'at most {mi.MAX_FIELD_LENGTH} characters' in warnings
+    assert 'already used by "Course C"' in warnings
 
 
 # -------- annotations
@@ -828,6 +938,43 @@ def test_server_channel_missing():
     assert not report.errors
 
 
+def test_server_checks_channels():
+    # The "channels.csv" entries are resolved against the catalog to report the channels that
+    # do not exist yet and the references already used by another channel.
+    existing = mi.ChannelUpdate(path=['Migration', 'Course A'], description='D')
+    missing = mi.ChannelUpdate(path=['Migration', 'Course B'], reference='lti:moodle:1')
+    taken = mi.ChannelUpdate(path=['Migration'], reference='lti:moodle:2')
+    client = make_client(catalog={'channels': [
+        {'oid': 'c1', 'title': 'Migration', 'parent_oid': None},
+        {'oid': 'c2', 'title': 'Course A', 'parent_oid': 'c1'},
+        {'oid': 'c3', 'title': 'Other', 'parent_oid': None, 'external_ref': 'lti:moodle:2'},
+    ]})
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, {}, report, summary, channels=[existing, missing, taken])
+    assert existing.object_id == 'c2'
+    assert missing.object_id is None
+    assert taken.object_id == 'c1'
+    assert not report.errors
+    warnings = '\n'.join(report.warnings)
+    assert 'Channel "Migration/Course B" does not exist yet' in warnings
+    assert 'Channel "Migration/Course A" does not exist yet' not in warnings
+    assert 'Reference "lti:moodle:2" (channel "Migration") is already used' in warnings
+    assert 'Reference "lti:moodle:1"' not in warnings
+
+
+def test_server_checks_channels_catalog_error():
+    # Without the catalog the channels cannot be resolved, but the audit still succeeds.
+    update = mi.ChannelUpdate(path=['Migration'], description='D')
+    client = make_client(catalog_exc=request_error())
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, {}, report, summary, channels=[update])
+    assert update.object_id is None
+    assert not report.errors
+    assert any('check slugs and channels' in w for w in report.warnings)
+
+
 # -------- ensure_personal_channel
 
 
@@ -1212,6 +1359,150 @@ def test_import_media_multistream_compose_error(tmp_path):
     assert summary.merged_videos == 0
 
 
+# -------- channels import
+
+
+def test_build_channel_paths():
+    catalog = {'channels': [
+        {'oid': 'c1', 'title': 'Migration', 'parent_oid': None},
+        {'oid': 'c2', 'title': 'Course A', 'parent_oid': 'c1'},
+        {'oid': 'c3', 'title': 'Year 1', 'parent_oid': 'c2'},
+        {'oid': 'c4', 'title': 'Course A', 'parent_oid': None},  # same title at the root
+        {'title': 'No oid', 'parent_oid': None},  # ignored
+    ]}
+    assert mi.build_channel_paths(catalog) == {
+        'Migration': 'c1',
+        'Migration/Course A': 'c2',
+        'Migration/Course A/Year 1': 'c3',
+        'Course A': 'c4',
+    }
+
+
+def test_build_channel_paths_empty():
+    assert mi.build_channel_paths({}) == {}
+
+
+def test_build_channel_paths_loop():
+    # A channel that is its own ancestor must not loop forever.
+    catalog = {'channels': [{'oid': 'c1', 'title': 'Loop', 'parent_oid': 'c1'}]}
+    assert mi.build_channel_paths(catalog) == {'Loop': 'c1'}
+
+
+def test_ensure_channel_existing():
+    client = make_client()
+    paths = {'Migration': 'c1', 'Migration/Course A': 'c2'}
+    assert mi.ensure_channel(client, ['Migration', 'Course A'], paths) == 'c2'
+    client.api.assert_not_called()
+
+
+def test_ensure_channel_creates_root():
+    client = make_client(api_map={'channels/add/': {'oid': 'cRoot'}})
+    paths = {}
+    assert mi.ensure_channel(client, ['Root'], paths) == 'cRoot'
+    assert paths == {'Root': 'cRoot'}
+    _, kwargs = client.api.call_args
+    # A channel created at the root of the catalog has no parent.
+    assert kwargs['data'] == {'title': 'Root'}
+
+
+def test_apply_channels_metadata_existing_channel():
+    update = mi.ChannelUpdate(
+        path=['Migration', 'Course A'],
+        description='<p>My description</p>',
+        reference='lti:moodle.example.local:245',
+    )
+    client = make_client(catalog={'channels': [
+        {'oid': 'c1', 'title': 'Migration', 'parent_oid': None},
+        {'oid': 'c2', 'title': 'Course A', 'parent_oid': 'c1'},
+    ]})
+    summary = mi.Summary()
+    mi.apply_channels_metadata(client, [update], summary)
+    called_urls = [call.args[0] for call in client.api.call_args_list]
+    assert 'channels/add/' not in called_urls
+    _, kwargs = client.api.call_args
+    assert kwargs['data'] == {
+        'oid': 'c2',
+        'description': '<p>My description</p>',
+        'external_ref': 'lti:moodle.example.local:245',
+    }
+    assert update.object_id == 'c2'
+    assert summary.channels_updated == 1
+    assert summary.channels_failed == 0
+
+
+def test_apply_channels_metadata_creates_missing_channels():
+    update = mi.ChannelUpdate(path=['Migration', 'Course A', 'Year 1'], description='D')
+    created: list[dict] = []
+
+    def api(url, **kwargs):
+        if url == 'channels/add/':
+            created.append(kwargs['data'])
+            return {'oid': f'c{len(created) + 1}'}
+        return {}
+
+    client = make_client(
+        catalog={'channels': [{'oid': 'c1', 'title': 'Migration', 'parent_oid': None}]},
+    )
+    client.api = mock.MagicMock(side_effect=api)
+    summary = mi.Summary()
+    mi.apply_channels_metadata(client, [update], summary)
+    # Only the missing levels are created, each one below the previous one.
+    assert created == [
+        {'title': 'Course A', 'parent': 'c1'},
+        {'title': 'Year 1', 'parent': 'c2'},
+    ]
+    edits = [c for c in client.api.call_args_list if c.args[0] == 'channels/edit/']
+    assert [c.kwargs['data'] for c in edits] == [{'oid': 'c3', 'description': 'D'}]
+    assert summary.channels_updated == 1
+
+
+def test_apply_channels_metadata_no_channel():
+    client = make_client()
+    summary = mi.Summary()
+    mi.apply_channels_metadata(client, [], summary)
+    client.get_catalog.assert_not_called()
+    client.api.assert_not_called()
+    assert summary.channels_updated == 0
+
+
+def test_apply_channels_metadata_catalog_error():
+    # Without the catalog no channel can be resolved, so all of them are counted as failed.
+    client = make_client(catalog_exc=request_error())
+    summary = mi.Summary()
+    mi.apply_channels_metadata(
+        client,
+        [mi.ChannelUpdate(path=['A'], description='D'),
+         mi.ChannelUpdate(path=['B'], description='D')],
+        summary,
+    )
+    client.api.assert_not_called()
+    assert summary.channels_updated == 0
+    assert summary.channels_failed == 2
+
+
+def test_apply_channels_metadata_continues_on_error():
+    # A channel that cannot be updated does not prevent the next ones from being updated.
+    first = mi.ChannelUpdate(path=['A'], description='D')
+    second = mi.ChannelUpdate(path=['B'], description='D')
+    client = make_client(catalog={'channels': [
+        {'oid': 'c1', 'title': 'A', 'parent_oid': None},
+        {'oid': 'c2', 'title': 'B', 'parent_oid': None},
+    ]})
+
+    def api(url, **kwargs):
+        if url == 'channels/edit/' and kwargs['data']['oid'] == 'c1':
+            raise mi.NudgisRequestError('boom', status_code=500)
+        return {}
+
+    client.api = mock.MagicMock(side_effect=api)
+    summary = mi.Summary()
+    mi.apply_channels_metadata(client, [first, second], summary)
+    assert first.object_id is None
+    assert second.object_id == 'c2'
+    assert summary.channels_updated == 1
+    assert summary.channels_failed == 1
+
+
 # -------- planning / report
 
 
@@ -1244,8 +1535,21 @@ def test_count_planned():
     assert summary.annotations_existing == 1
 
 
+def test_count_planned_channels():
+    # Every valid "channels.csv" entry would be applied by an "--apply" run.
+    summary = mi.Summary()
+    mi.count_planned({}, summary, channels=[
+        mi.ChannelUpdate(path=['A'], description='D'),
+        mi.ChannelUpdate(path=['B'], reference='lti:moodle:1'),
+    ])
+    assert summary.channels_updated == 2
+
+
 def test_print_summary_smoke():
-    summary = mi.Summary(medias_imported=2, import_failures=1)
+    summary = mi.Summary(
+        medias_imported=2, import_failures=1, channels_updated=1, channels_failed=1,
+        invalid_channels=1,
+    )
     summary.drop_media('x', mi.UNIMPORTABLE_CORRUPTED)
     # Should not raise in either mode.
     mi.print_summary(summary, applied=True)
@@ -1276,6 +1580,14 @@ def build_valid_tree(tmp_path):
         b'm1,chapter,1000,Intro,Hi,,\n'
         b'm1,slide,2000,Slide,,,doc.pdf\n'
         b'm2,chapter,0,Start,,,\n',
+    )
+    write(
+        tmp_path / 'channels.csv',
+        (
+            CHANNELS_HEADER + '\n'
+            'Migration,"<p>Root channel</p>",\n'
+            'Migration/sub,,lti:moodle.example.local:245\n'
+        ).encode('utf-8'),
     )
 
 
@@ -1327,6 +1639,9 @@ def test_mass_import_dry_run(tmp_path, patched_client):
         '--log-level', 'debug',
     ]) == 0
     patched_client.add_media.assert_not_called()
+    called_urls = [call.args[0] for call in patched_client.api.call_args_list]
+    assert 'channels/edit/' not in called_urls
+    assert 'channels/add/' not in called_urls
 
 
 def test_mass_import_apply(tmp_path, patched_client):
@@ -1340,6 +1655,19 @@ def test_mass_import_apply(tmp_path, patched_client):
     content = mapping_file.read_text()
     assert 'm1,v_migration:m1' in content
     assert 'm2,v_migration:m2' in content
+    # The channel metadata are applied once every media has been imported.
+    edits = [c for c in patched_client.api.call_args_list if c.args[0] == 'channels/edit/']
+    assert [c.kwargs['data'].get('description') for c in edits] == ['<p>Root channel</p>', None]
+    assert edits[1].kwargs['data']['external_ref'] == 'lti:moodle.example.local:245'
+    add_media_index = min(
+        index for index, call in enumerate(patched_client.api.call_args_list)
+        if call.args[0] == 'subtitles/add/'
+    )
+    edit_index = min(
+        index for index, call in enumerate(patched_client.api.call_args_list)
+        if call.args[0] == 'channels/edit/'
+    )
+    assert add_media_index < edit_index
 
 
 def test_mass_import_ids_to_process(tmp_path, patched_client):
