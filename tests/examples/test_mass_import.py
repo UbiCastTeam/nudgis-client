@@ -357,6 +357,24 @@ def test_metadata_too_long_field(tmp_path):
     assert not report.errors
 
 
+@pytest.mark.parametrize('prefix', ['mscspeaker-', 'mscpath-'])
+def test_metadata_too_long_channel_title(tmp_path, prefix):
+    # An over long channel title is truncated so that the media stays close to where it
+    # belongs, instead of being sent to a completely different channel.
+    row = ['m1', 'Title'] + [''] * 12 + [f'{prefix}Courses/' + 'T' * 300] + [''] * 3
+    path = write(
+        tmp_path / 'metadata.csv',
+        (METADATA_HEADER + '\n' + ','.join(row) + '\n').encode('utf-8'),
+    )
+    report = mi.Report()
+    summary = mi.Summary()
+    groups = {'m1': group('m1')}
+    mi.validate_metadata_csv(path, groups, None, report, summary)
+    assert any('channel title' in w and 'truncated' in w for w in report.warnings)
+    assert groups['m1'].metadata['channel'] == f'{prefix}Courses/' + 'T' * mi.MAX_FIELD_LENGTH
+    assert not report.errors
+
+
 def test_metadata_media_without_row(tmp_path):
     path = write(
         tmp_path / 'metadata.csv', (METADATA_HEADER + '\nm1,Title,,,,,,,,,,,,,,,,\n').encode()
@@ -432,12 +450,10 @@ def test_channels_valid(tmp_path):
 
 
 def test_channels_invalid_rows_dropped(tmp_path):
-    long_title = 'T' * (mi.MAX_FIELD_LENGTH + 1)
     content = (
         CHANNELS_HEADER + '\n'
         ',Desc,\n'  # empty path
         'Course A//Year 1,Desc,\n'  # empty channel title in the path
-        f'Course A/{long_title},Desc,\n'  # channel title too long
         'Course A,Desc,\n'  # valid row
         'Course A,Other desc,\n'  # duplicate path
         'Course B,,\n'  # nothing to apply
@@ -448,13 +464,30 @@ def test_channels_invalid_rows_dropped(tmp_path):
     channels = mi.validate_channels_csv(path, report, summary)
     assert [channel.path for channel in channels] == [['Course A']]
     assert channels[0].description == 'Desc'
-    assert summary.invalid_channels == 5
+    assert summary.invalid_channels == 4
     assert not report.errors
     warnings = '\n'.join(report.warnings)
     assert 'empty or invalid "path"' in warnings
-    assert f'longer than {mi.MAX_FIELD_LENGTH} characters' in warnings
     assert 'duplicate "path"' in warnings
     assert 'no metadata to apply' in warnings
+
+
+def test_channels_too_long_title_truncated(tmp_path):
+    # An over long channel title is truncated (as in the "channel" column of "metadata.csv")
+    # so that the metadata are applied to the channel the media have been imported into.
+    long_title = 'T' * (mi.MAX_FIELD_LENGTH + 1)
+    content = CHANNELS_HEADER + '\n' + f'Course A/{long_title},Desc,\n'
+    path = write(tmp_path / 'channels.csv', content.encode('utf-8'))
+    report = mi.Report()
+    summary = mi.Summary()
+    channels = mi.validate_channels_csv(path, report, summary)
+    assert [channel.path for channel in channels] == [
+        ['Course A', 'T' * mi.MAX_FIELD_LENGTH],
+    ]
+    warnings = '\n'.join(report.warnings)
+    assert f'longer than {mi.MAX_FIELD_LENGTH} characters, truncated' in warnings
+    assert summary.invalid_channels == 0
+    assert not report.errors
 
 
 def test_channels_unusable_reference_dropped(tmp_path):
@@ -926,6 +959,37 @@ def test_server_speaker_user_error():
     assert any('Could not check speaker' in w for w in report.warnings)
 
 
+def test_server_speaker_subchannel_target():
+    # A personal sub-channel target resolves the speaker like "mscspeaker" does, and is not
+    # looked up as an explicit channel (it is resolved during the import).
+    groups = {'b': group_with('b', metadata={'channel': 'mscspeaker-Courses/2026',
+                                             'speaker_email': 'known@x'})}
+    client = make_client(api_map={
+        'users/': {'users': [{'email': 'known@x', 'id': '25508'}]},
+        'perms/get/': {'global_permissions': {'can_have_personal_channel': {'val': True}}},
+    })
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary)
+    urls = [c.args[0] for c in client.api.call_args_list]
+    assert 'users/' in urls
+    assert 'channels/get/' not in urls
+    assert groups['b'].metadata['channel'] == 'mscspeaker-Courses/2026'
+    assert not report.errors
+
+
+def test_server_speaker_subchannel_without_email():
+    # As for "mscspeaker", a personal sub-channel target without recipient is not importable.
+    groups = {'b': group_with('b', metadata={'channel': 'mscspeaker-Courses',
+                                             'speaker_email': ''})}
+    client = make_client()
+    report = mi.Report()
+    summary = mi.Summary()
+    mi.server_checks(client, groups, report, summary)
+    assert 'b' not in groups
+    assert summary.unimportable_media[mi.UNIMPORTABLE_NO_SPEAKER] == ['b']
+
+
 def test_server_channel_missing():
     groups = {'d': group_with('d', metadata={'channel': 'mscid-CID'})}
     client = make_client(api_exc={'channels/get/': request_error()})
@@ -1031,8 +1095,38 @@ def test_build_media_metadata_no_row():
     assert mi.build_media_metadata(None) == {}
 
 
+@pytest.mark.parametrize('channel, expected', [
+    ('mscpath-A/B', 'mscpath-A/B'),
+    ('mscpath-A/' + 'B' * 300, 'mscpath-A/' + 'B' * mi.MAX_FIELD_LENGTH),
+    ('mscspeaker-' + 'C' * 201 + '/D', 'mscspeaker-' + 'C' * mi.MAX_FIELD_LENGTH + '/D'),
+    # Targets without a path are left untouched.
+    ('mscspeaker', 'mscspeaker'),
+    ('mscid-' + 'x' * 300, 'mscid-' + 'x' * 300),
+    ('a-slug', 'a-slug'),
+])
+def test_truncate_channel_titles(channel, expected):
+    assert mi.truncate_channel_titles(channel) == expected
+
+
+@pytest.mark.parametrize('channel, expected', [
+    ('mscspeaker', []),
+    ('mscspeaker-Top', ['Top']),
+    ('mscspeaker-Top channel/Mid channel/Sub channel',
+     ['Top channel', 'Mid channel', 'Sub channel']),
+    ('mscspeaker- Top / Sub /', ['Top', 'Sub']),  # empty and padded titles are cleaned up
+    ('mscspeaker-', []),  # an empty path targets the personal channel itself
+    ('mscspeakers', None),
+    ('mscpath-Top/Sub', None),
+    ('', None),
+])
+def test_parse_speaker_path(channel, expected):
+    assert mi.parse_speaker_path(channel) == expected
+
+
 @pytest.mark.parametrize('main, rel_dir, row, expected', [
     ('Migration', '.', {'channel': 'mscid-x'}, 'mscid-x'),
+    # A personal channel target is kept as is, it is resolved during the import.
+    ('Migration', '.', {'channel': 'mscspeaker-Sub'}, 'mscspeaker-Sub'),
     ('Migration', 'sub/deep', {'channel': ''}, 'mscpath-Migration/sub/deep'),
     ('mscpath-Root', 'a', None, 'mscpath-Root/a'),
     ('Migration', '.', None, 'mscpath-Migration'),
@@ -1170,6 +1264,70 @@ def test_import_media_without_metadata_row(tmp_path):
     assert kwargs['channel'] == 'mscpath-Migration/sub'
     assert summary.medias_imported == 1
     assert summary.metadata_applied == 0
+
+
+def speaker_channel_client(created):
+    # A client resolving the personal channel of "known@x" and creating the missing levels.
+    def api(url, **kwargs):
+        if url == 'users/':
+            return {'users': [{'email': 'known@x', 'id': '25508'}]}
+        if url == 'channels/personal/':
+            return {'oid': 'cPerso'}
+        if url == 'channels/get/':
+            raise request_error(404)
+        if url == 'channels/add/':
+            created.append((kwargs['data']['title'], kwargs['data']['parent']))
+            return {'oid': f'c{len(created)}'}
+        return {}
+
+    client = make_client()
+    client.api = mock.MagicMock(side_effect=api)
+    return client
+
+
+def test_import_media_speaker_subchannel(tmp_path):
+    # Media targeting a sub-channel of a personal channel are uploaded into the resolved oid,
+    # and the resolution is shared by every media of the same speaker.
+    write(tmp_path / 'm1.mp4')
+    write(tmp_path / 'm2.mp4')
+    g1 = mi.MediaGroup('m1', None, tmp_path / 'm1.mp4', Path('.'))
+    g1.metadata = {'title': 'T1', 'channel': 'mscspeaker-Courses/2026',
+                   'speaker_email': 'known@x'}
+    g2 = mi.MediaGroup('m2', None, tmp_path / 'm2.mp4', Path('.'))
+    g2.metadata = {'title': 'T2', 'channel': 'mscspeaker-Courses/2026',
+                   'speaker_email': 'known@x'}
+    created = []
+    client = speaker_channel_client(created)
+    summary = mi.Summary()
+
+    mapping = mi.import_media(
+        client, {'m1': g1, 'm2': g2}, 'Migration', tmp_path, tmp_path / 'map.csv',
+        tmp_path / 'temp', summary,
+    )
+
+    assert mapping == {'m1': 'v_migration:m1', 'm2': 'v_migration:m2'}
+    channels = [kwargs['channel'] for _, kwargs in client.add_media.call_args_list]
+    assert channels == ['mscid-c2', 'mscid-c2']
+    # The channels of the path are created once, not once per media.
+    assert created == [('Courses', 'cPerso'), ('2026', 'c1')]
+    assert summary.medias_imported == 2
+    assert summary.import_failures == 0
+
+
+def test_import_media_speaker_subchannel_error(tmp_path):
+    # A personal sub-channel that cannot be resolved makes its media an import failure only.
+    write(tmp_path / 'm1.mp4')
+    g1 = mi.MediaGroup('m1', None, tmp_path / 'm1.mp4', Path('.'))
+    g1.metadata = {'title': 'T1', 'channel': 'mscspeaker-Courses', 'speaker_email': 'ghost@x'}
+    client = make_client(api_map={'users/': {'users': []}})
+    summary = mi.Summary()
+    mapping = mi.import_media(
+        client, {'m1': g1}, 'Migration', tmp_path, tmp_path / 'map.csv', tmp_path / 'temp',
+        summary,
+    )
+    assert mapping == {}
+    client.add_media.assert_not_called()
+    assert summary.import_failures == 1
 
 
 def test_import_media_continues_on_upload_error(tmp_path):
@@ -1403,6 +1561,80 @@ def test_ensure_channel_creates_root():
     _, kwargs = client.api.call_args
     # A channel created at the root of the catalog has no parent.
     assert kwargs['data'] == {'title': 'Root'}
+
+
+def test_get_or_create_channel_existing():
+    client = make_client(api_map={'channels/get/': {'info': {'oid': 'cSub'}}})
+    assert mi.get_or_create_channel(client, 'Sub', 'cParent') == 'cSub'
+    urls = [c.args[0] for c in client.api.call_args_list]
+    assert 'channels/add/' not in urls
+
+
+def test_get_or_create_channel_created():
+    client = make_client(
+        api_exc={'channels/get/': request_error(404)},
+        api_map={'channels/add/': {'oid': 'cSub'}},
+    )
+    assert mi.get_or_create_channel(client, 'Sub', 'cParent') == 'cSub'
+    _, kwargs = client.api.call_args
+    assert kwargs['data'] == {'title': 'Sub', 'parent': 'cParent'}
+
+
+def test_get_or_create_channel_error():
+    # Any error other than a 404 is propagated (the media is counted as an import failure).
+    client = make_client(api_exc={'channels/get/': request_error()})
+    with pytest.raises(mi.NudgisRequestError):
+        mi.get_or_create_channel(client, 'Sub', 'cParent')
+
+
+def test_get_or_create_channel_unexpected_response():
+    client = make_client(api_map={'channels/get/': {}})
+    with pytest.raises(RuntimeError):
+        mi.get_or_create_channel(client, 'Sub', 'cParent')
+
+
+def test_ensure_speaker_channel():
+    created = []
+    client = speaker_channel_client(created)
+    cache = {}
+    row = {'speaker_email': 'known@x|other@x'}  # only the first speaker is used
+    assert mi.ensure_speaker_channel(client, row, ['Courses', '2026'], cache) == 'mscid-c2'
+    # Each level is created below the previous one, starting at the personal channel.
+    assert created == [('Courses', 'cPerso'), ('2026', 'c1')]
+    assert cache == {
+        'known@x': 'cPerso', 'known@x/Courses': 'c1', 'known@x/Courses/2026': 'c2',
+    }
+    # A second media targeting the same channel is resolved from the cache, without any call.
+    client.api.reset_mock()
+    assert mi.ensure_speaker_channel(client, row, ['Courses', '2026'], cache) == 'mscid-c2'
+    client.api.assert_not_called()
+    # A sibling channel of the same speaker only creates the missing level.
+    assert mi.ensure_speaker_channel(client, row, ['Courses', '2025'], cache) == 'mscid-c3'
+    assert created[-1] == ('2025', 'c1')
+    assert [c.args[0] for c in client.api.call_args_list] == ['channels/get/', 'channels/add/']
+
+
+def test_ensure_speaker_channel_personal_channel_only():
+    # An empty path targets the personal channel itself (no sub-channel is created).
+    created = []
+    client = speaker_channel_client(created)
+    assert mi.ensure_speaker_channel(client, {'speaker_email': 'known@x'}, [], {}) == 'mscid-cPerso'
+    assert not created
+
+
+def test_ensure_speaker_channel_without_email():
+    client = make_client()
+    with pytest.raises(RuntimeError):
+        mi.ensure_speaker_channel(client, {'speaker_email': ''}, ['Courses'], {})
+    with pytest.raises(RuntimeError):
+        mi.ensure_speaker_channel(client, None, ['Courses'], {})
+    client.api.assert_not_called()
+
+
+def test_ensure_speaker_channel_unknown_speaker():
+    client = make_client(api_map={'users/': {'users': []}})
+    with pytest.raises(RuntimeError):
+        mi.ensure_speaker_channel(client, {'speaker_email': 'ghost@x'}, ['Courses'], {})
 
 
 def test_apply_channels_metadata_existing_channel():

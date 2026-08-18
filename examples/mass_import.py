@@ -28,6 +28,11 @@ Multi-stream (side-by-side) media are combined into a single video with ``ffmpeg
 the import (see ``compose_multistream.py``); the temporary combined file is written under
 ``--temp-dir`` and removed once the upload succeeds.
 
+A media can be sent to the personal channel of its first speaker by setting its ``channel``
+to ``mscspeaker``, or to a sub-channel of that personal channel with ``mscspeaker-<path>`` (for
+example ``mscspeaker-Courses/2026``). The sub-channels that do not exist yet are created during
+the import.
+
 The channel metadata listed in ``channels.csv`` are applied at the very end of the import,
 once every media (and therefore every channel of the folder tree) has been created. The
 ``path`` of a channel is resolved from the root of the Nudgis catalog, so it must include the
@@ -113,6 +118,9 @@ LANG_SUFFIX_RE = re.compile(r'^(.+)_([a-z]{3})$')
 MAX_FIELD_LENGTH = 200
 # Maximum number of streams that can be combined into a multi-stream media.
 MAX_STREAMS = 6
+# Channel target designating the personal channel of the first speaker of a media. It can be
+# suffixed with the path of one of its sub-channels ("mscspeaker-Top channel/Sub channel").
+SPEAKER_TARGET = 'mscspeaker'
 
 
 @dataclass
@@ -511,6 +519,15 @@ def validate_metadata_csv(
                     )
                     row[field_name] = value[:MAX_FIELD_LENGTH]
 
+            channel = (row.get('channel') or '').strip()
+            truncated = truncate_channel_titles(channel)
+            if truncated != channel:
+                report.warning(
+                    f'{METADATA_FILENAME}:{line}: a channel title of "{channel}" is longer '
+                    f'than {MAX_FIELD_LENGTH} characters, truncated.'
+                )
+                row['channel'] = truncated
+
             names = _split_pipe((row.get('speaker_name') or ''), drop_empty=False)
             emails = _split_pipe((row.get('speaker_email') or ''), drop_empty=False)
             if len(names) != len(emails):
@@ -550,8 +567,9 @@ def validate_channels_csv(
 
     The file is optional; if it is missing, no channel metadata is applied. A row that cannot
     be applied at all (empty, malformed or duplicate ``path``, no metadata to apply) is
-    dropped and counted as an invalid channel entry; an unusable ``reference`` (too long or
-    already used) is dropped on its own so that the description can still be applied.
+    dropped and counted as an invalid channel entry; an over-long channel title is truncated
+    and an unusable ``reference`` (too long or already used) is dropped on its own so that the
+    description can still be applied.
     """
     logger.info('Validating channels CSV "%s".', csv_path)
     if not csv_path.is_file():
@@ -586,13 +604,14 @@ def validate_channels_csv(
                 summary.invalid_channels += 1
                 continue
             if any(len(title) > MAX_FIELD_LENGTH for title in titles):
-                # Truncating a title would target another channel, so the whole row is dropped.
+                # The titles are truncated the same way as the channel targets of
+                # "metadata.csv" so that the metadata are applied to the channel the media
+                # have been imported into.
                 report.warning(
                     f'{CHANNELS_FILENAME}:{line}: a channel title of "{path}" is longer than '
-                    f'{MAX_FIELD_LENGTH} characters, row ignored.'
+                    f'{MAX_FIELD_LENGTH} characters, truncated.'
                 )
-                summary.invalid_channels += 1
-                continue
+                titles = [title[:MAX_FIELD_LENGTH] for title in titles]
             display_path = '/'.join(titles)
             if display_path in seen_paths:
                 report.warning(
@@ -826,7 +845,7 @@ def server_checks(
     """
     Run the server-side audit checks (slugs, annotation types, speakers, channels).
 
-    Annotations referencing an unknown type are dropped, media targeting ``mscspeaker``
+    Annotations referencing an unknown type are dropped, media targeting a personal channel
     without a ``speaker_email`` are dropped, and media with an unresolvable explicit channel
     fall back to the folder-based channel. The ``channels.csv`` entries are resolved against
     the catalog to report the channels that do not exist yet and the references already used.
@@ -937,17 +956,18 @@ def server_checks(
                     summary.unimportable_annotations += len(group.annotations) - len(kept)
                     group.annotations = kept
 
-    # Speaker resolution for "mscspeaker" destinations: a media without any speaker cannot
-    # be imported; missing users and permissions are reconciled (or reported) below.
+    # Speaker resolution for the personal channel destinations: a media without any speaker
+    # cannot be imported; missing users and permissions are reconciled (or reported) below.
     speaker_emails: set[str] = set()
     no_speaker: list[str] = []
     for source_id, group in groups.items():
         row = group.metadata
-        if row and (row.get('channel') or '').strip() == 'mscspeaker':
+        channel = (row.get('channel') or '').strip() if row else ''
+        if parse_speaker_path(channel) is not None:
             emails = _split_pipe(row.get('speaker_email') or '')
             if not emails:
                 report.warning(
-                    f'Media "{source_id}" targets "mscspeaker" but has no "speaker_email", '
+                    f'Media "{source_id}" targets "{channel}" but has no "speaker_email", '
                     'media skipped.'
                 )
                 no_speaker.append(source_id)
@@ -991,7 +1011,8 @@ def server_checks(
         if not channel:
             continue
         params = None
-        if channel == 'mscspeaker':
+        if parse_speaker_path(channel) is not None:
+            # The personal channels and their sub-channels are resolved during the import.
             continue
         elif channel.startswith('mscid-'):
             params = {'oid': channel[len('mscid-'):]}
@@ -1119,18 +1140,26 @@ def import_media(
     Import every media group, fill in ``summary`` and return the ``source_id`` -> ``oid`` map.
 
     A media is counted as imported (and recorded in the mapping) as soon as its ``add_media``
-    step succeeds; a media that cannot be created is counted as an import failure and skipped.
+    step succeeds; a media that cannot be created is counted as an import failure and skipped
+    (a media targeting the sub-channel of a personal channel that cannot be resolved included).
     Each linked element (audio track, subtitle, annotation) is then attached independently and
     accounted for as already existing, imported or failed, so a single element failure does
     not prevent the others from being attached.
     """
     failures: dict[str, str] = {}
     mapping: dict[str, str] = {}
+    # Oids of the personal channels and of their sub-channels, resolved on demand.
+    speaker_channels: dict[str, str] = {}
     for source_id, group in groups.items():
         merged = False
         # Media creation: a failure here means the media itself could not be imported.
         try:
             channel = resolve_channel(main_channel, group.rel_dir, group.metadata)
+            if titles := parse_speaker_path(channel):
+                # A sub-channel of a personal channel can only be targeted by its object id.
+                channel = ensure_speaker_channel(
+                    ngc, group.metadata, titles, speaker_channels
+                )
             metadata = build_media_metadata(group.metadata)
             metadata['external_ref'] = group.external_ref
             existing = bool(group.object_id)
@@ -1309,6 +1338,67 @@ def ensure_channel(ngc: NudgisClient, titles: list[str], paths: dict[str, str]) 
     return parent_oid
 
 
+def get_or_create_channel(ngc: NudgisClient, title: str, parent_oid: str) -> str:
+    """
+    Return the oid of the sub-channel of ``parent_oid`` titled ``title``, creating it if needed.
+
+    Unlike :func:`ensure_channel`, the lookup is made on the server because the personal
+    channels are not part of the catalog.
+    """
+    try:
+        response = ngc.api('channels/get/', params={'title': title, 'parent': parent_oid})
+    except NudgisRequestError as err:
+        if err.status_code != 404:
+            raise
+    else:
+        oid = (response.get('info') or {}).get('oid')
+        if not oid:
+            raise RuntimeError(f'unexpected response when getting the channel "{title}"')
+        return oid
+    oid = ngc.api(
+        'channels/add/', method='post', data={'title': title, 'parent': parent_oid}
+    )['oid']
+    logger.info('Created channel "%s" under "%s" with oid "%s".', title, parent_oid, oid)
+    return oid
+
+
+def ensure_speaker_channel(
+    ngc: NudgisClient,
+    row: dict[str, str] | None,
+    titles: list[str],
+    cache: dict[str, str],
+) -> str:
+    """
+    Return the "mscid-..." target of a sub-channel of the personal channel of a speaker.
+
+    The path is resolved (and its missing levels created) below the personal channel of the
+    first speaker of the media because the API can only target a personal sub-channel by its
+    object id. ``cache`` holds the oids already resolved, keyed by the email of the speaker
+    followed by the titles of the channels, so that each channel is resolved only once.
+    """
+    emails = _split_pipe((row or {}).get('speaker_email') or '')
+    if not emails:
+        raise RuntimeError('no "speaker_email" to resolve the personal channel')
+    email = emails[0]
+    oid = cache.get(email)
+    if oid is None:
+        response = ngc.api('users/', params={'search': email, 'limit': 1})
+        users = response.get('users') or []
+        if not users:
+            raise RuntimeError(f'the speaker "{email}" does not exist on the server')
+        oid = ngc.api('channels/personal/', params={'id': users[0]['id']})['oid']
+        cache[email] = oid
+        logger.info('The personal channel of "%s" is "%s".', email, oid)
+    for index, title in enumerate(titles):
+        key = '/'.join([email, *titles[:index + 1]])
+        sub_oid = cache.get(key)
+        if sub_oid is None:
+            sub_oid = get_or_create_channel(ngc, title, oid)
+            cache[key] = sub_oid
+        oid = sub_oid
+    return f'mscid-{oid}'
+
+
 def apply_channels_metadata(
     ngc: NudgisClient,
     channels: list[ChannelUpdate],
@@ -1438,6 +1528,39 @@ def print_summary(summary: Summary, applied: bool) -> None:
     logger.info('\n'.join(lines))
 
 
+def truncate_channel_titles(channel: str) -> str:
+    """
+    Truncate the channel titles of a path based target ("mscpath-..." or "mscspeaker-...").
+
+    A title longer than what Nudgis can store cannot be matched against the catalog, so the
+    target would end up in a completely different channel; truncating each title keeps the
+    media close to where it belongs.
+    """
+    for prefix in ('mscpath-', f'{SPEAKER_TARGET}-'):
+        if channel.startswith(prefix):
+            titles = channel[len(prefix):].split('/')
+            return prefix + '/'.join(title[:MAX_FIELD_LENGTH] for title in titles)
+    return channel
+
+
+def parse_speaker_path(channel: str) -> list[str] | None:
+    """
+    Split the sub-channel path of a personal channel target.
+
+    Return the titles of the channels making up the path below the personal channel of the
+    speaker (an empty list for the personal channel itself, which is resolved by the server)
+    or ``None`` when the given channel does not target a personal channel at all.
+    """
+    if channel == SPEAKER_TARGET:
+        return []
+    if channel.startswith(f'{SPEAKER_TARGET}-'):
+        return [
+            title for part in channel[len(SPEAKER_TARGET) + 1:].split('/')
+            if (title := part.strip())
+        ]
+    return None
+
+
 def resolve_channel(
     main_channel: str,
     rel_dir: Path,
@@ -1447,7 +1570,8 @@ def resolve_channel(
     Determine the destination channel of a media.
 
     The channel column of ``metadata.csv`` takes precedence; otherwise the folder tree is
-    mirrored below the main migration channel using an "mscpath" identifier.
+    mirrored below the main migration channel using an "mscpath" identifier. A personal
+    sub-channel target is left as is, it is resolved by :func:`ensure_speaker_channel`.
     """
     if row:
         channel = (row.get('channel') or '').strip()
