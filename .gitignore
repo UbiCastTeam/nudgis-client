@@ -36,3 +36,4 @@ conf-*.json
 backups
 temp
 *.csv
+*.log
