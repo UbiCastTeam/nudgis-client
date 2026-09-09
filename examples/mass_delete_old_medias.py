@@ -182,7 +182,7 @@ def _prepare_mail(
     medias = list({media['oid']: media for media in medias}.values())
 
     ms_perma_url = ngc.conf['SERVER_URL'] + '/permalink/'
-    ms_edit_url = ngc.conf['SERVER_URL'] + '/edit/iframe/'
+    ms_edit_url = ngc.conf['SERVER_URL'] + '/edit/'
     context = {
         'media_count': len(medias),
         'media_size_pp': format_bytes(sum(media['storage_used'] for media in medias)),
@@ -203,7 +203,7 @@ def _prepare_mail(
             'title': media['title'],
             'add_date': media_add_date.strftime('%Y-%m-%d'),
             'age': format_timedelta(now - media_add_date),
-            'view_url': f'{ms_perma_url}{media["oid"]}/iframe/',
+            'view_url': f'{ms_perma_url}{media["oid"]}/',
             'edit_url': f'{ms_edit_url}{media["oid"]}/#id_categories',
         }
         if 'views_over_period' in media:
